@@ -15,6 +15,7 @@ class SchedulingPolicy(Enum):
 
     FCFS = "fcfs"
     PRIORITY = "priority"
+    UTILITY="utility"
 
 
 class RequestQueue(ABC):
