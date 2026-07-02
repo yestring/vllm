@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
+import math
 import enum
 import time
 from collections import deque
@@ -283,24 +283,38 @@ class Request:
             return self.num_prompt_tokens - self.num_computed_tokens
         return 1.0
     
-    def utility_score(self, weights: dict, now: float) -> float:
-        """计算当前效用值，权重可配置"""
-        # 等待时间（归一化到 [0,1]）
-        wait_score = min(self.waiting_time / weights.get('wait_saturate', 1.0), 1.0)
-        # 优先级（越小越高）
-        priority_score = 1.0 - min(self.priority / 9.0, 1.0)
-        # 短 Prompt 奖励
+    def utility_score(self, weights: dict, now: float, kv_utilization: float = 0.0) -> float:
+        """
+        计算请求的效用值
+        
+        Args:
+            weights: 各维度权重
+            now: 当前时间
+            kv_utilization: KV Cache 利用率 (0-1)，用于在高负载时惩罚大请求
+        """
+        wait = now - self.arrival_time
+        wait_score = min(wait / 1.0, 1.0)
+        priority_score = 1.0 - (self.priority / 9.0)
         short_score = 1.0 / (1.0 + math.log(self.num_prompt_tokens + 1))
-        # 公平性（被抢占越多越优先）
-        fair_score = 1.0 + min(self.num_preemptions * 0.2, 1.0)
-        # 多模态惩罚
+        fair_score = 1.0 + self.num_preemptions * 0.2
         mm_penalty = 0.3 if self.has_encoder_inputs else 0.0
         
-        return (weights.get('wait', 0.4) * wait_score +
-                weights.get('priority', 0.3) * priority_score +
-                weights.get('short', 0.15) * short_score +
-                weights.get('fair', 0.15) * fair_score -
-                weights.get('mm_penalty', 0.1) * mm_penalty)
+        # ---- 新增：KV Cache 感知惩罚 ----
+        # 当 KV Cache 使用率超过 80% 时，惩罚需要大量新 KV 块的请求
+        kv_penalty = 0.0
+        if kv_utilization > 0.8:
+            # 剩余需要计算的 Token 数越多，惩罚越大
+            remaining_tokens = self.num_tokens - self.num_computed_tokens
+            kv_penalty = (remaining_tokens / 1000.0) * (kv_utilization - 0.8) * 10.0
+        
+        utility = (weights.get('wait', 0.4) * wait_score +
+                   weights.get('priority', 0.3) * priority_score +
+                   weights.get('short', 0.15) * short_score +   # 降低短请求权重
+                   weights.get('fair', 0.15) * fair_score -     # 增加公平性权重
+                   weights.get('mm', 0.1) * mm_penalty -
+                   kv_penalty)  # 新增 KV 惩罚
+        
+        return max(utility, 0.0)
 
     
     def get_skip_reading_prefix_cache(self) -> bool:

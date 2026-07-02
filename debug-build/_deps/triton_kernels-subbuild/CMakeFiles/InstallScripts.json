@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/hx/vLLM/vllm-main/debug-build/_deps/triton_kernels-subbuild/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

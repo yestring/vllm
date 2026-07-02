@@ -1427,7 +1427,11 @@ class EngineArgs:
         # multi-step scheduling has been removed; corresponding arguments
         # are no longer supported.
         scheduler_group.add_argument(
-            "--scheduling-policy", **scheduler_kwargs["policy"]
+            "--scheduling-policy",
+            **{
+                **scheduler_kwargs["policy"],
+                "choices": ["fcfs", "priority", "utility"],  # 显式指定可选值
+            }
         )
         scheduler_group.add_argument(
             "--enable-chunked-prefill",
@@ -1462,6 +1466,22 @@ class EngineArgs:
             "--stream-interval", **scheduler_kwargs["stream_interval"]
         )
 
+        # ========== 新增：调度器优化参数 ==========
+        scheduler_group.add_argument(
+            "--stable-window", **scheduler_kwargs["stable_window"]
+        )
+        scheduler_group.add_argument(
+            "--max-candidates", **scheduler_kwargs["max_candidates"]
+        )
+        scheduler_group.add_argument(
+            "--high-load-threshold", **scheduler_kwargs["high_load_threshold"]
+        )
+        scheduler_group.add_argument(
+            "--kv-util-threshold", **scheduler_kwargs["kv_util_threshold"]
+        )
+
+
+        
         # Compilation arguments
         compilation_kwargs = get_kwargs(CompilationConfig)
         compilation_group = parser.add_argument_group(

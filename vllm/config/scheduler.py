@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 RunnerType = Literal["generate", "pooling", "draft"]
-SchedulerPolicy = Literal["fcfs", "priority"]
+SchedulerPolicy = Literal["fcfs", "priority","utility"]
 
 
 @config
@@ -38,6 +38,23 @@ class SchedulerConfig:
     Note: This is stored in the ModelConfig, and is used only here to
     disable chunked prefill and prefix caching for encoder-decoder models.
     """
+
+    # ========== 新增：调度器优化选项 ==========
+    stable_window: int = Field(default=10, ge=1)
+    """Batch 稳定性窗口：保持 Batch 组成不变的步数"""
+    
+    max_candidates: int = Field(default=64, ge=1)
+    """Utility 调度时考虑的最大候选请求数"""
+    
+    high_load_threshold: int = Field(default=32, ge=1)
+    """判断高负载的 running 请求数阈值"""
+    
+    kv_util_threshold: float = Field(default=0.85, ge=0.0, le=1.0)
+    """KV Cache 使用率阈值，超过后切换策略"""
+
+
+    
+
 
     DEFAULT_MAX_NUM_BATCHED_TOKENS: ClassVar[int] = 2048
     DEFAULT_MAX_NUM_BATCHED_TOKENS_FOR_BATCHED_DP: ClassVar[int] = 256

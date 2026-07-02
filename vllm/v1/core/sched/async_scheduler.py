@@ -12,6 +12,12 @@ logger = init_logger(__name__)
 class AsyncScheduler(Scheduler):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        # 从 scheduler_config 读取自定义参数
+        cfg = self.scheduler_config
+        self.STABLE_WINDOW = getattr(cfg, 'stable_window', 10)
+        self.MAX_CANDIDATES = getattr(cfg, 'max_candidates', 64)
+        self.HIGH_LOAD_THRESHOLD = getattr(cfg, 'high_load_threshold', 32)
+        self.KV_UTIL_THRESHOLD = getattr(cfg, 'kv_util_threshold', 0.85)
         # reusable read-only placeholder list for speculative decoding.
         self._spec_token_placeholders: list[int] = [-1] * self.num_spec_tokens
         self.pp_size = self.parallel_config.pipeline_parallel_size

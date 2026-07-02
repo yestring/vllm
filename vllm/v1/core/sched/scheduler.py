@@ -93,7 +93,27 @@ class Scheduler(SchedulerInterface):
             )
         self.structured_output_manager = structured_output_manager
         self.is_encoder_decoder = vllm_config.model_config.is_encoder_decoder
+        self.stats = {
+            'schedule_calls': 0,
+            'schedule_total_ms': 0.0,
+            'schedule_score_ms': 0.0,
+            'schedule_sort_ms': 0.0,
+            'schedule_alloc_ms': 0.0,
+            'queue_len_samples': [],
+        }
 
+        # ========== 新增：Batch 稳定性控制 ==========
+        self.stable_batch_counter = 0
+        self.STABLE_WINDOW = 10  # 保持 10 步不变
+        self.previous_batch_req_ids = set()
+        
+        # ========== 新增：自适应切换相关 ==========
+        self.utility_enabled = True
+        self.consecutive_high_load_steps = 0
+        self.HIGH_LOAD_THRESHOLD = 32  # running > 32 视为高负载
+
+
+        
         # include_finished_set controls whether a separate set of finished
         # request ids should be included in the EngineCoreOutputs returned
         # by update_from_outputs(). This is currently used in the multi-engine
@@ -385,8 +405,73 @@ class Scheduler(SchedulerInterface):
                 num_new_tokens = num_new_tokens // block_size * block_size
         return num_new_tokens
 
+
+
+
+
+
+
+    def _should_use_utility(self) -> bool:
+        if self.policy != SchedulingPolicy.UTILITY:
+            return False
+    
+        running_len = len(self.running)
+        queue_len = len(self.waiting) + len(self.skipped_waiting)
+    
+        kv_usage = self.kv_cache_manager.usage
+    
+        if (running_len > self.HIGH_LOAD_THRESHOLD
+                or queue_len > 100
+                or kv_usage > self.KV_UTIL_THRESHOLD):
+    
+            self.consecutive_high_load_steps += 1
+    
+            if self.consecutive_high_load_steps >= 5:
+                return False
+    
+        else:
+            self.consecutive_high_load_steps = 0
+    
+        return True
+    
+    def _get_kv_utilization(self) -> float:
+        return self.kv_cache_manager.usage
+    
+    def _get_scheduler_stats(self) -> dict:
+        """获取并重置调度器统计"""
+        stats = self.stats
+        self.stats = {
+            'schedule_calls': 0,
+            'schedule_total_ms': 0.0,
+            'schedule_score_ms': 0.0,
+            'schedule_sort_ms': 0.0,
+            'schedule_alloc_ms': 0.0,
+            'queue_len_samples': [],
+        }
+        return stats
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
+
+        _step_start = time.perf_counter()
+        _queue_len = len(self.waiting) + len(self.skipped_waiting)
+        self.stats['queue_len_samples'].append(_queue_len)
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -634,20 +719,37 @@ class Scheduler(SchedulerInterface):
 
 
 
+            
+
+
+            use_utility = self._should_use_utility()
 
 
 
 
 
-            if self.policy == SchedulingPolicy.UTILITY:
+
+            if self.policy == SchedulingPolicy.UTILITY and use_utility:
                 # ============================================================
-                #  新逻辑：效用驱动调度（Utility Scheduling）
-                #  收集所有候选 → 按效用排序 → 贪心尝试分配
+                #  UTILITY 调度分支（带性能埋点和优化）
                 # ============================================================
-                step_skipped_waiting = create_request_queue(self.policy)
+                _t0 = time.perf_counter()
+                
+                # ---------- 1. 收集候选请求（限制数量） ----------
+                MAX_CANDIDATES = 64  # 新增：限制候选数量
+                all_waiting = list(self.waiting) + list(self.skipped_waiting)
+                if len(all_waiting) > MAX_CANDIDATES:
+                    all_waiting.sort(key=lambda r: r.arrival_time)
+                    all_waiting = all_waiting[:MAX_CANDIDATES]
+                
                 now = time.monotonic()
                 available_blocks = self.kv_cache_manager.block_pool.get_num_free_blocks()
+                kv_util = self._get_kv_utilization()
                 candidates = []
+                
+                # 获取当前 running 中的请求 ID（用于 Batch 稳定性）
+                running_req_ids = {req.request_id for req in self.running}
+                step_skipped_waiting = create_request_queue(self.policy)
         
                 # 1. 收集候选请求
                 for req in list(self.waiting) + list(self.skipped_waiting):
@@ -671,13 +773,32 @@ class Scheduler(SchedulerInterface):
                     if req.has_encoder_inputs:
                         encoder_cost = sum(1 for _ in req.mm_features)
         
-                    utility = req.utility_score(self.waiting._weights, now)
+                     # ========== 新增：Batch 稳定性加分 ==========
+                    stability_bonus = 0.0
+                    if req.request_id in running_req_ids:
+                        stability_bonus = 0.3  # 已经在 running 中的请求优先保留
+                    
+                    utility = req.utility_score(
+                        self.waiting._weights if hasattr(self.waiting, '_weights') else {},
+                        now,
+                        kv_util  # 传入 KV Cache 使用率
+                    ) + stability_bonus
+                    
                     candidates.append((req, utility, need_tokens, need_blocks, encoder_cost))
-        
+
+
+                _t1 = time.perf_counter()
+                self.stats['schedule_score_ms'] += (_t1 - _t0) * 1000
+                
                 # 2. 按效用密度排序
                 lambda_block = 0.1
                 candidates.sort(key=lambda x: x[1] / (x[2] + lambda_block * x[3]), reverse=True)
-        
+                _t2 = time.perf_counter()
+                self.stats['schedule_sort_ms'] += (_t2 - _t1) * 1000
+
+
+
+                
                 # 3. 贪心尝试分配
                 for req, util, nt, nb, ec in candidates:
                     if nt > token_budget or nb > available_blocks or ec > encoder_compute_budget:
@@ -687,6 +808,7 @@ class Scheduler(SchedulerInterface):
                         self._try_schedule_request(
                             req,
                             scheduled_loras,
+                            token_budget,
                             scheduled_new_reqs,
                             scheduled_resumed_reqs,
                             req_to_new_blocks,
@@ -707,7 +829,19 @@ class Scheduler(SchedulerInterface):
                     else:
                         # 分配失败，放入 step_skipped_waiting，等待下一轮
                         step_skipped_waiting.prepend_request(req)
-        
+
+                _t3 = time.perf_counter()
+                self.stats['schedule_alloc_ms'] += (_t3 - _t2) * 1000
+                
+                # 记录总耗时
+                self.stats['schedule_total_ms'] += (_t3 - _step_start) * 1000
+                self.stats['schedule_calls'] += 1
+
+                 # ---------- 日志输出（每 100 步打印一次） ----------
+                if self.current_step % 100 == 0 and self.stats['schedule_calls'] > 0:
+                    avg_total = self.stats['schedule_total_ms'] / self.stats['schedule_calls']
+                    logger.info(f"[SCHED_PERF] avg_total={avg_total:.3f}ms, queue_len={_queue_len}")
+                
                 # 重新入队跳过的请求
                 if step_skipped_waiting:
                     self.skipped_waiting.prepend_requests(step_skipped_waiting)
@@ -1209,6 +1343,15 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+
+
+        # 每 100 步打印一次摘要
+        if self.current_step % 100 == 0:
+            avg_total = self.stats['schedule_total_ms'] / max(1, self.stats['schedule_calls'])
+            logger.info(f"[SCHED_PERF] avg_total={avg_total:.3f}ms, queue_len={_queue_len}")
+
+
+        
         return scheduler_output
 
     def _build_kv_connector_meta(
@@ -2741,6 +2884,7 @@ class Scheduler(SchedulerInterface):
         self,
         request: Request,
         scheduled_loras: set,
+        token_budget: int,
         scheduled_new_reqs: list,
         scheduled_resumed_reqs: list,
         req_to_new_blocks: dict,
@@ -2759,7 +2903,7 @@ class Scheduler(SchedulerInterface):
         若失败，返回 (False, 0, 0, encoder_compute_budget)，请求保留在原队列中。
         """
         request_id = request.request_id
-    
+        scheduled_running_reqs = [] 
         # ---------- 1. 计算已缓存的 Token（Prefix Caching） ----------
         num_external_computed_tokens = 0
         load_kv_async = False
@@ -3039,3 +3183,16 @@ class Scheduler(SchedulerInterface):
             self.waiting.remove_request(request)
         if request in self.skipped_waiting:
             self.skipped_waiting.remove_request(request)
+
+
+    def get_and_reset_stats(self):
+        stats = self.stats
+        self.stats = {
+            'schedule_calls': 0,
+            'schedule_total_ms': 0.0,
+            'schedule_score_ms': 0.0,
+            'schedule_sort_ms': 0.0,
+            'schedule_alloc_ms': 0.0,
+            'queue_len_samples': [],
+        }
+        return stats

@@ -93,14 +93,21 @@ elif sys.platform.startswith("linux") and os.getenv("VLLM_TARGET_DEVICE") is Non
     if torch.version.hip is not None:
         VLLM_TARGET_DEVICE = "rocm"
         logger.info("Auto-detected ROCm")
-    elif torch.version.xpu is not None:
-        VLLM_TARGET_DEVICE = "xpu"
-        logger.info("Auto-detected XPU")
-    elif torch.version.cuda is not None:
-        VLLM_TARGET_DEVICE = "cuda"
-        logger.info("Auto-detected CUDA")
     else:
-        VLLM_TARGET_DEVICE = "cpu"
+        # 检查 XPU 支持（用 try-except 保护）
+        try:
+            has_xpu = bool(torch.version.xpu)
+        except AttributeError:
+            has_xpu = False
+        
+        if has_xpu:
+            VLLM_TARGET_DEVICE = "xpu"
+            logger.info("Auto-detected XPU")
+        elif torch.version.cuda is not None:
+            VLLM_TARGET_DEVICE = "cuda"
+            logger.info("Auto-detected CUDA")
+        else:
+            VLLM_TARGET_DEVICE = "cpu"
 
 
 def is_sccache_available() -> bool:

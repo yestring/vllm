@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
+import time
 import heapq
 from abc import ABC, abstractmethod
 from collections import deque
@@ -213,24 +213,24 @@ class UtilityRequestQueue(RequestQueue):
     The utility is computed via `Request.utility_score(weights, now)`.
     """
 
-    def __init__(self, utility_weights: dict[str, float] | None = None):
-        """
-        Args:
-            utility_weights: dictionary with keys like 'wait', 'priority',
-                'short', 'fair', 'mm_penalty' and their corresponding weights.
-        """
+    def __init__(self, utility_weights: dict | None = None, top_k: int = 32):
         self._requests: list[Request] = []
         self._weights = utility_weights or {}
-
+        self._top_k = top_k  # 新增：Top-K 限制
+    
     def _reorder(self) -> None:
-        """Reorder the internal list by utility descending."""
+        """重排序，只保留 Top-K 个最高 Utility 的请求"""
         if not self._requests:
             return
         now = time.monotonic()
+        # 按 utility 降序排序，只取前 top_k 个
         self._requests.sort(
             key=lambda req: req.utility_score(self._weights, now),
             reverse=True
         )
+        if len(self._requests) > self._top_k:
+            self._requests = self._requests[:self._top_k]
+
 
     def add_request(self, request: Request) -> None:
         """Add a request to the queue."""
