@@ -123,6 +123,7 @@ class KVCacheManager:
         pcp_world_size: int = 1,
         metrics_collector: KVCacheMetricsCollector | None = None,
         watermark: float = 0.0,
+        enable_loss_eviction: bool = False,
     ) -> None:
         self.max_model_len = max_model_len
         # When unset, fall back to `max_model_len` so the recycling-aware cap
@@ -130,7 +131,8 @@ class KVCacheManager:
         # always supplies the real value at runtime.
         if max_num_batched_tokens is None:
             max_num_batched_tokens = max_model_len
-
+        self.scheduler_block_size = scheduler_block_size
+        self.hash_block_size = hash_block_size
         self.enable_caching = enable_caching
         self.use_eagle = use_eagle
         self.log_stats = log_stats
@@ -139,7 +141,8 @@ class KVCacheManager:
         # this comment because when the log stats is enabled there are still
         # potential configs we could expose in the future.
         self.prefix_cache_stats = PrefixCacheStats() if log_stats else None
-
+        self.enable_loss_eviction=enable_loss_eviction
+        
         self.coordinator = get_kv_cache_coordinator(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
@@ -152,6 +155,7 @@ class KVCacheManager:
             scheduler_block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
             metrics_collector=self.metrics_collector,
+            enable_loss_eviction=self.enable_loss_eviction,
         )
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
@@ -198,6 +202,51 @@ class KVCacheManager:
         stats = self.prefix_cache_stats
         self.prefix_cache_stats = PrefixCacheStats()
         return stats
+
+
+
+
+
+    def get_request_cache_info(self, request: Request) -> dict:
+        _, num_computed_tokens = self.get_computed_blocks(request)
+        
+        total_blocks = self.kv_cache_config.num_blocks
+        block_size = self.scheduler_block_size
+        free_blocks = self.block_pool.get_num_free_blocks()
+        kv_utilization = 1.0 - (free_blocks / total_blocks) if total_blocks > 0 else 0.0
+        
+        # 使用 token 级别的复用率
+        total_prompt_tokens = request.num_prompt_tokens
+        hit_rate = num_computed_tokens / total_prompt_tokens if total_prompt_tokens > 0 else 0.0
+        
+        total_blocks_needed = (total_prompt_tokens + block_size - 1) // block_size
+        computed_blocks = (num_computed_tokens + block_size - 1) // block_size if num_computed_tokens > 0 else 0
+        
+        return {
+            'computed_blocks': computed_blocks,
+            'num_computed_tokens': num_computed_tokens,
+            'hit_rate': min(hit_rate, 1.0),
+            'kv_utilization': kv_utilization,
+            'total_blocks_needed': total_blocks_needed,
+        }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    
 
     def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int]:
         """Get the computed (cached) blocks for the request.

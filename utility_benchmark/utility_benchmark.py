@@ -123,22 +123,23 @@ class PromptGenerator:
         return prompts
     
     @classmethod
-    def generate_mixed(cls, total: int, 
+    def generate_mixed(cls, total: int,
                        short_ratio: float = 0.4,
                        medium_ratio: float = 0.4,
                        long_ratio: float = 0.2) -> List[str]:
-        """生成混合长度的提示词，模拟真实负载"""
+        """生成混合长度的提示词：长请求优先到达（long → medium → short）"""
+    
         short_count = int(total * short_ratio)
         medium_count = int(total * medium_ratio)
         long_count = total - short_count - medium_count
-        
-        prompts = []
-        prompts.extend(cls.generate_short(short_count))
-        prompts.extend(cls.generate_medium(medium_count))
-        prompts.extend(cls.generate_long(long_count))
-        
-        # 打乱顺序，模拟随机到达
-        random.shuffle(prompts)
+    
+        long_prompts = cls.generate_long(long_count)
+        medium_prompts = cls.generate_medium(medium_count)
+        short_prompts = cls.generate_short(short_count)
+    
+        # 按负载顺序排列：先长，再中，最后短
+        prompts = long_prompts + medium_prompts + short_prompts
+    
         return prompts
 
 
@@ -497,26 +498,26 @@ class TestScenarios:
             {
                 'name': 'high_concurrency',
                 'description': '高并发纯短请求',
-                'prompt_generator': lambda: PromptGenerator.generate_short(2000),
-                'concurrency_levels': [],
+                'prompt_generator': lambda: PromptGenerator.generate_short(800),
+                'concurrency_levels': [4,16,32,64,128],
             },
             {
                 'name': 'mixed_length',
                 'description': '混合长度（20%短 + 40%中 + 40%长）',
-                'prompt_generator': lambda: PromptGenerator.generate_mixed(2000, 0.2, 0.4, 0.4),
-                'concurrency_levels': [],
+                'prompt_generator': lambda: PromptGenerator.generate_mixed(800, 0.2, 0.4, 0.4),
+                'concurrency_levels': [4,16,32,64,128],
             },
             {
                 'name': 'head_of_line_blocking',
                 'description': '队头阻塞测试（10%超长 + 90%超短）',
-                'prompt_generator': lambda: PromptGenerator.generate_mixed(2000, 0.8, 0.1, 0.1),
-                'concurrency_levels': [8,16,32,64,128,256],
+                'prompt_generator': lambda: PromptGenerator.generate_mixed(800, 0.9, 0, 0.1),
+                'concurrency_levels': [4,16,32,64,128],
             },
             {
                 'name': 'extreme_long',
                 'description': '极端长请求（全部长/代码请求）',
-                'prompt_generator': lambda: PromptGenerator.generate_long(2000),
-                'concurrency_levels': [],
+                'prompt_generator': lambda: PromptGenerator.generate_long(800),
+                'concurrency_levels': [4,16,32,64,128],
             },
         ]
 

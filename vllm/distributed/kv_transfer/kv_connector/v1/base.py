@@ -39,7 +39,7 @@ The class provides the following primitives:
         build_connector_worker_meta() - builds metadata to be sent
             back to the scheduler-side connector
 """
-
+from __future__ import annotations
 import enum
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable
@@ -701,3 +701,10 @@ class KVConnectorBase_V1(ABC):
         )
 
         return None
+
+
+    # 在 KVConnectorBase_V1 类中新增
+    
+    def submit_layer_kv(self, req_id: str, layer_idx: int, block_ids: BlockIds):
+        """流式传输接口：提交单层 KV"""
+        raise NotImplementedError

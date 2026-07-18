@@ -117,9 +117,21 @@ def init_none_hash(hash_fn: Callable[[Any], bytes]):
 @dataclass(slots=True)
 class KVCacheBlock:
     """KV-cache block metadata."""
-
     # Block ID, ranging from 0 to num_gpu_blocks - 1.
     block_id: int
+
+
+    # ===== 新增：策略统计元数据（符合你文档的设计） =====
+    ema_hotness: float = 0.0           # EMA 平滑热度 (0~1)
+    last_access_time: float = 0.0      # 上次访问时间戳
+    prefix_share_count: int = 0        # 共享该块的请求数
+    num_tokens: int = 0                # 块内有效 Token 数（用于计费）
+    eviction_loss: float = float('inf')
+
+
+    
+    
+    
     # Reference count.
     ref_cnt: int = 0
     # The hash key (block hash + group id) of the block, only available

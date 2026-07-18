@@ -462,6 +462,13 @@ class GPUModelRunner(
         self.routed_experts_initialized = False
         self.max_model_len = model_config.max_model_len
 
+
+        
+        self.kv_connector = None
+        self._streaming_enabled = False
+        self._streaming_hooks_registered = False
+        self.kv_role = None
+        
         # Always set to false after the first forward pass
         self.calculate_kv_scales = self.cache_config.calculate_kv_scales
         self.dcp_world_size = self.parallel_config.decode_context_parallel_size
@@ -4074,7 +4081,9 @@ class GPUModelRunner(
 
         if self.routed_experts_initialized:
             self.routed_experts_capturer.clear_buffer()
-
+            
+        self._ensure_streaming_hooks_registered()
+        
         # If ngram_gpu is used, we need to copy the scheduler_output to avoid
         # the modification has influence on the scheduler_output in engine core process.
         # The replace is much faster than deepcopy.
@@ -4351,6 +4360,7 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -5172,12 +5182,17 @@ class GPUModelRunner(
         Args:
             load_dummy_weights: load dummy weights instead of real weights.
         """
+        logger.info(f"kv_connector in GPUModelRunner: {self.kv_connector}")
         logger.info_once(
             "Starting to load model %s...",
             self.model_config.model,
             scope="global",
         )
-
+        
+        # ===== 在 STOCK_TORCH_COMPILE 分支之前添加 =====
+        cudagraph_mode = self.compilation_config.cudagraph_mode
+        # ==============================================
+        
         if self.parallel_config.enable_eplb:
             self.eplb_state = EplbState(self.parallel_config, self.device)
             eplb_models = 0
@@ -5191,6 +5206,23 @@ class GPUModelRunner(
                 self.model = model_loader.load_model(
                     vllm_config=self.vllm_config, model_config=self.model_config
                 )
+                # ===== 2. 在包装之前注册钩子 =====
+                # 此时 self.model 是原始模型，尚未被 CUDAGraphWrapper 包装
+                # 在 load_model 中注册钩子时
+                self.kv_role = self.vllm_config.kv_transfer_config.kv_role if self.vllm_config.kv_transfer_config else None
+                print(self.kv_role)
+                if self.kv_role == 'kv_producer':
+                    self._register_layer_hooks_on_raw_model(self.model)
+                    self._streaming_enabled = True   # ← 加这行
+                else:
+                    logger.info("Consumer node: skipping layer hooks")
+                # ================================
+                
+                # 3. 后续包装逻辑（CUDAGraphWrapper 等）
+                if is_breakable_cudagraph_enabled() and cudagraph_mode != CUDAGraphMode.NONE:
+                    self.model = BreakableCUDAGraphWrapper(self.model, self.vllm_config)
+                elif cudagraph_mode.has_full_cudagraphs() and not self.parallel_config.use_ubatching:
+                    self.model = CUDAGraphWrapper(self.model, self.vllm_config, runtime_mode=CUDAGraphMode.FULL)
                 if self.lora_config:
                     self.model = self.load_lora_model(
                         self.model, self.vllm_config, self.device
@@ -5299,6 +5331,8 @@ class GPUModelRunner(
         ):
             self.eplb_state.start_async_loop()
 
+        
+            
         if (
             self.vllm_config.compilation_config.mode
             == CompilationMode.STOCK_TORCH_COMPILE
@@ -5346,6 +5380,161 @@ class GPUModelRunner(
 
         get_offloader().post_init()
 
+
+        # ========== 新增：统一初始化 kv_connector（所有编译模式） ==========
+        if self.kv_connector is None:
+            try:
+                from vllm.distributed.kv_transfer import get_kv_transfer_group
+                group = get_kv_transfer_group()
+                if group is not None and hasattr(group, 'connector'):
+                    self.kv_connector = group.connector
+                    logger.info("kv_connector initialized successfully.")
+                else:
+                    logger.debug("KV transfer group not available; streaming hooks disabled.")
+            except Exception as e:
+                logger.warning(f"Failed to get kv_connector: {e}")
+        # ===================================================================
+
+
+
+
+
+
+
+    # 在 GPUModelRunner 类中新增方法
+    def _register_layer_hooks_on_raw_model(self, raw_model):
+        """在原始模型（未包装）上注册 forward hook"""
+        layers = None
+        if hasattr(raw_model, 'model') and hasattr(raw_model.model, 'layers'):
+            layers = raw_model.model.layers
+        elif hasattr(raw_model, 'layers'):
+            layers = raw_model.layers
+        
+        if layers is None:
+            logger.warning("Cannot find layers in raw model")
+            return
+        
+        from functools import partial
+        for layer_idx, layer in enumerate(layers):
+            layer.register_forward_hook(partial(self._on_layer_forward, layer_idx))
+        
+
+        logger.info(f"✅ Registered hooks on {len(layers)} layers (before CUDAGraph wrapping)")
+
+    
+    def _ensure_streaming_hooks_registered(self):
+        if self.kv_connector is not None:
+            return
+        try:
+            from vllm.distributed.kv_transfer import get_kv_transfer_group
+            connector = get_kv_transfer_group()
+            if connector is not None:
+                self.kv_connector = connector
+                # 如果钩子尚未注册，则注册（但理论上已在 load_model 中注册）
+                if not self._streaming_hooks_registered:
+                    self._register_layer_hooks()
+                    self._streaming_hooks_registered = True
+                    logger.info("✅ Streaming KV transfer hooks registered successfully.")
+                else:
+                    logger.info("✅ kv_connector set (hooks already registered).")
+        except Exception as e:
+            logger.error(f"Failed to get connector: {e}")
+            
+    
+    def _register_layer_hooks(self):
+        """注册每一层的 forward hook"""
+        logger.info("=== _register_layer_hooks called ===")
+        if self.kv_connector is None:
+            logger.warning("kv_connector is None, cannot register hooks")
+            return
+    
+        raw_model = self.get_model()
+        logger.info(f"raw_model type: {type(raw_model)}")
+    
+        # 通用查找 layers 的方法
+        layers = None
+        if hasattr(raw_model, 'model') and hasattr(raw_model.model, 'layers'):
+            layers = raw_model.model.layers
+        elif hasattr(raw_model, 'layers'):
+            layers = raw_model.layers
+        elif hasattr(raw_model, 'language_model') and hasattr(raw_model.language_model, 'model') and hasattr(raw_model.language_model.model, 'layers'):
+            layers = raw_model.language_model.model.layers
+        elif hasattr(raw_model, 'language_model') and hasattr(raw_model.language_model, 'layers'):
+            layers = raw_model.language_model.layers
+    
+        if layers is None:
+            logger.error("Cannot find decoder layers for streaming transfer")
+            return
+    
+        logger.info(f"Found {len(layers)} layers, registering hooks...")
+    
+        from functools import partial
+    
+        for layer_idx, layer in enumerate(layers):
+            layer.register_forward_hook(partial(self._on_layer_forward, layer_idx))
+    
+        self._streaming_enabled = True
+        logger.info(f"✅ Registered layer hooks for {len(layers)} layers")
+
+    def _on_layer_forward(self, layer_idx: int, module, input, output):
+        """每层 forward 完成后回调"""
+        logger.info(f"🔥 _on_layer_forward called for layer {layer_idx}")  # ← 加这行
+        # 检查是否应该触发传输
+        if not self._streaming_enabled:
+            return
+        
+        # 从 forward_context 获取当前 batch 信息
+        from vllm.forward_context import get_forward_context
+        forward_ctx = get_forward_context()
+        if forward_ctx is None:
+            return
+        
+        # 获取 attention metadata 和 slot mapping
+        attn_metadata = forward_ctx.attn_metadata
+        if attn_metadata is None:
+            return
+        
+        # 获取当前 batch 的请求 ID 和 block 信息
+        # 这里需要从 input_batch 中获取
+        if self.input_batch is None or self.input_batch.num_reqs == 0:
+            return
+        
+        # 构建该层需要传输的 block 列表
+        # 注意：这里简化处理，实际需要从 slot_mapping 中提取该层对应的 block IDs
+        # 但由于 vLLM 的 block 是跨层共享的，我们直接提交整个请求的 block 列表
+        req_ids = self.input_batch.req_ids
+        for req_id in req_ids:
+            req_idx = self.input_batch.req_id_to_index.get(req_id)
+            if req_idx is None:
+                continue
+            # 获取该请求的所有 block IDs (从 block_table 获取)
+            req_state = self.requests.get(req_id)
+            if req_state is None:
+                continue
+            block_ids = req_state.block_ids  # 这是一个 tuple of lists，每个 group 一个列表
+            if block_ids:
+                # 调用 connector 提交该层的 KV
+                self.kv_connector.submit_layer_kv(req_id, layer_idx, block_ids)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        
     def _setup_eagle3_aux_hidden_state_outputs(self) -> None:
         if not self.use_aux_hidden_state_outputs:
             return
@@ -7371,6 +7560,8 @@ class GPUModelRunner(
             # group
             self.drafter.validate_same_kv_cache_group(kv_cache_config)
 
+        # ===== 修正：先定义 kv_transfer_group 为 None =====
+        kv_transfer_group = None
         if has_kv_transfer_group() and not is_profiling:
             kv_transfer_group = get_kv_transfer_group()
             if self.cross_layers_kv_cache is not None:
@@ -7381,6 +7572,12 @@ class GPUModelRunner(
             else:
                 kv_transfer_group.register_kv_caches(kv_caches)
             kv_transfer_group.set_host_xfer_buffer_ops(copy_kv_blocks)
+    
+        # ===== 保存 connector =====
+        if kv_transfer_group is not None:
+            self.kv_connector = kv_transfer_group
+
+        
 
     def _get_attention_kv_cache_gid(self) -> int:
         """Find the KV cache group index for attention layers.

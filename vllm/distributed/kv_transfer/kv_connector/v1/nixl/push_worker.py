@@ -114,6 +114,8 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         self._push_writer_stop = threading.Event()
         self._push_writer_thread: threading.Thread | None = None
 
+
+        self._submitted_layers = set()  # 记录已提交的层，避免重复
     # --- Lifecycle ----------------------------------------------------- #
 
     def register_kv_caches(self, kv_caches: dict[str, "torch.Tensor"]):
@@ -191,7 +193,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
 
     def _push_writer_loop(self) -> None:
         sleep_s = _PUSH_WRITER_POLL_INTERVAL_MS / 1000.0
-
+    
         while not self._push_writer_stop.is_set():
             try:
                 # 1. D registrations to send.
@@ -201,23 +203,54 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                     except queue.Empty:
                         break
                     self._send_registration_to_p(rid, rd)
-
+    
                 # 2. P-side finished blocks; match against pending regs.
+                # ============================================================
+                # 修改点：支持三元组 (rid, blocks, layer_idx)
+                # ============================================================
                 while True:
                     try:
-                        rid, blocks = self._finished_blocks_inbox.get_nowait()
+                        item = self._finished_blocks_inbox.get_nowait()
                     except queue.Empty:
                         break
+                    logger.info(f"[STREAMING] writer got item: {item}")
+                    # 解析 item：支持二元组或三元组
+                    if len(item) == 3:
+                        rid, blocks, layer_idx = item
+                    else:
+                        rid, blocks = item
+                        layer_idx = None
+                    
+                    # 检查是否有匹配的 D 端注册
                     matched = self._pop_matching_registration(rid)
                     if matched is not None:
+                        # 有注册：立即发送
                         self._do_start_push_kv(rid, blocks, matched)
                     else:
-                        self._push_finished_blocks[rid] = blocks
-
+                        # 无注册：暂存等待
+                        # 如果是逐层传输，需要合并同一请求的多个块
+                        if rid in self._push_finished_blocks:
+                            existing = self._push_finished_blocks[rid]
+                            # 提取第一个 group 的 block_ids（都是 list）
+                            existing_list = existing[0] if existing and isinstance(existing, tuple) else existing
+                            blocks_list = blocks[0] if blocks and isinstance(blocks, tuple) else blocks
+                            if isinstance(existing_list, list) and isinstance(blocks_list, list):
+                                merged_list = list(set(existing_list + blocks_list))
+                                self._push_finished_blocks[rid] = (merged_list,)
+                            else:
+                                # 如果结构不一致，直接覆盖
+                                self._push_finished_blocks[rid] = blocks
+                        else:
+                            self._push_finished_blocks[rid] = blocks
+                        
+                        # 记录已提交的层，防止重复提交
+                        if layer_idx is not None:
+                            key = f"{rid}:{layer_idx}"
+                            self._submitted_layers.add(key)
+    
                 # 2b. Evict finished blocks for requests that have either
                 # completed (WRITE acknowledged) or whose lease expired
-                # without a D registration.  Drop pending registrations
-                # for the same reason so we don't leak state.
+                # without a D registration.
                 while True:
                     try:
                         rid = self._evict_finished_inbox.get_nowait()
@@ -225,7 +258,9 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                         break
                     self._push_finished_blocks.pop(rid, None)
                     self._pending_d_registrations.pop(rid, None)
-
+                    # 清理已提交的层记录
+                    self._submitted_layers = {k for k in self._submitted_layers if not k.startswith(f"{rid}:")}
+    
                 # 3. NIXL notifs: route PUSH_REG; forward the rest.
                 for notifs in self.nixl_wrapper.get_new_notifs().values():
                     for notif in notifs:
@@ -235,10 +270,9 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                             self._pending_completion_notifs.put(notif)
             except Exception:
                 logger.exception("nixl-push-writer error; continuing")
-
+    
             # Self-poll only while there is no other wake source: P-side
-            # finished blocks waiting for a D PUSH_REG match. All other
-            # progress is event-driven (see module docstring).
+            # finished blocks waiting for a D PUSH_REG match.
             if self._push_finished_blocks:
                 self._push_writer_stop.wait(timeout=sleep_s)
             else:
@@ -740,3 +774,18 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             self._push_writer_wake.set()
 
         return done_sending, done_recving
+
+
+
+    def submit_layer_kv(self, req_id: str, layer_idx: int, block_ids: BlockIds):
+        logger.info(f"[STREAMING] submit_layer_kv: req={req_id}, layer={layer_idx}, block_ids={block_ids}")
+        if not block_ids:
+            return
+        key = f"{req_id}:{layer_idx}"
+        if key in self._submitted_layers:
+            logger.info(f"[STREAMING] layer {layer_idx} already submitted, skipping")
+            return
+        self._submitted_layers.add(key)
+        self._finished_blocks_inbox.put((req_id, block_ids, layer_idx))
+        self._push_writer_wake.set()
+        logger.info(f"[STREAMING] queued layer {layer_idx} for req {req_id}")

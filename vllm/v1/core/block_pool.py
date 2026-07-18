@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable, Sequence
 from typing import Any
-
+import math, time
 from vllm.distributed.kv_events import (
     MEDIUM_GPU,
     AllBlocksCleared,
@@ -10,6 +10,7 @@ from vllm.distributed.kv_events import (
     BlockStored,
     KVCacheEvent,
 )
+from vllm.v1.core.kv_cache_policy import LossAwareEvictionPolicy, BaseEvictionPolicy
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
@@ -167,6 +168,7 @@ class BlockPool:
         hash_block_size: int,
         enable_kv_cache_events: bool = False,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        enable_loss_eviction: bool = False,   # ← 新增参数，默认 lru
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
@@ -181,6 +183,17 @@ class BlockPool:
         # enabled).
         self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
 
+        self.enable_loss_eviction = enable_loss_eviction  # ← 保存开关
+        if self.enable_loss_eviction:
+            self.eviction_policy = LossAwareEvictionPolicy(half_life_seconds=60.0)
+            logger.info("🚀 BlockPool: Loss-aware eviction policy is ENABLED")
+        else:
+            self.eviction_policy = None  # 使用默认 LRU
+            logger.info("🔄 BlockPool: Using default LRU eviction")
+
+
+
+        
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
         self.cached_block_hashes_by_block: dict[int, set[BlockHashWithGroupId]] = {}
@@ -196,6 +209,14 @@ class BlockPool:
 
         self.metrics_collector = metrics_collector
 
+
+
+
+
+
+
+
+    
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
     ) -> list[KVCacheBlock] | None:
@@ -283,6 +304,10 @@ class BlockPool:
             # in align mode. We skip null blocks here.
             if blk.is_null or (block_mask is not None and not block_mask[i]):
                 continue
+
+            # ===== 新增：记录该块包含的有效 Token 数 =====
+            blk.num_tokens = block_size  # 满块就是 block_size 个 token
+            # ============================================
             block_hash = new_block_hashes[i]
             num_hash_tokens = (num_cached_blocks + i + 1) * block_size
 
@@ -595,16 +620,15 @@ class BlockPool:
         return True
 
     def touch(self, blocks: Sequence[KVCacheBlock]) -> None:
-        """Touch a block increases its reference count by 1, and may remove
-        the block from the free queue. This is used when a block is hit by
-        another request with the same prefix.
-
-        Args:
-            blocks: A list of blocks to touch.
-        """
         for block in blocks:
-            # ref_cnt=0 means this block is in the free list (i.e. eviction
-            # candidate), so remove it.
+            # ===== 更新统计信息（供 Policy 使用） =====
+            if self.enable_loss_eviction:
+                # EMA 热度更新
+                block.ema_hotness = block.ema_hotness * 0.9 + 0.1
+                block.last_access_time = time.time()
+                block.prefix_share_count += 1
+            # ======================================
+            
             if block.ref_cnt == 0 and not block.is_null:
                 self.free_block_queue.remove(block)
             block.ref_cnt += 1
@@ -614,12 +638,8 @@ class BlockPool:
     def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
         """Free a list of blocks. The blocks should be ordered by their
         eviction priority, where the first block will be evicted first.
-
-        Args:
-            ordered_blocks: A list of blocks to free ordered by their eviction
-                priority.
         """
-        # Identify blocks with hash (LRU cache) and without it (will never match in APC)
+        # 1. 收集引用计数降为 0 的空闲块
         blocks_with_hash = []
         blocks_without_hash = []
         for block in ordered_blocks:
@@ -629,8 +649,17 @@ class BlockPool:
                     blocks_without_hash.append(block)
                 else:
                     blocks_with_hash.append(block)
-
-        # Blocks without hash always get evicted first - prepend them last to the tail
+    
+        # ===== Loss-aware 分支：调用 Policy =====
+        if self.enable_loss_eviction and self.eviction_policy is not None:
+            candidate_blocks = blocks_without_hash + blocks_with_hash
+            # 策略选择 victim（这里全部候选块都视为可驱逐）
+            sorted_blocks = self.eviction_policy.select_victims(candidate_blocks, len(candidate_blocks))
+            self.free_block_queue.prepend_n(sorted_blocks)
+            return
+        # ========================================
+    
+        # ===== 以下保持原始 LRU 逻辑 =====
         self.free_block_queue.prepend_n(blocks_without_hash)
         self.free_block_queue.append_n(blocks_with_hash)
 
@@ -721,3 +750,7 @@ class BlockPool:
         events = self.kv_event_queue
         self.kv_event_queue = []
         return events
+
+
+
+    

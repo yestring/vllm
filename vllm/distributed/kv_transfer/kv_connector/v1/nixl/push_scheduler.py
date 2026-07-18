@@ -140,13 +140,22 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
             params,
         )
 
+        print(f"我在push_scheduler.py里的update_state_after_alloc")
+        print(f"params:{params}")
         if not params:
             return
 
         # P side: track the request as in-batch so the lease accounting
         # matches what the worker expects on the next step.
+        # P side: track the request as in-batch
         if params.get("do_remote_decode"):
             self._reqs_in_batch.add(request.request_id)
+            # P side with host-buffer offload
+            if self.use_host_buffer:
+                self._reqs_need_save[request.request_id] = request
+                return
+            # P 端在这里返回，不进入注册生成逻辑
+            return
 
         # P side with host-buffer offload: defer save to the worker.
         if self.use_host_buffer and params.get("do_remote_decode"):
@@ -158,10 +167,10 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         if not params.get("do_remote_prefill"):
             return
 
-        if num_external_tokens <= 0:
-            # Nothing to receive: full prefix-cache hit on D, no
-            # registration to stage.
-            return
+        # if num_external_tokens <= 0:
+        #     # Nothing to receive: full prefix-cache hit on D, no
+        #     # registration to stage.
+        #     return
 
         # First-pass D path: stash registration data the worker will
         # ship to P on the next ``build_connector_meta`` cycle.
@@ -203,6 +212,10 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         # Mark as processed so a re-entry (e.g. preemption + reschedule)
         # doesn't re-stage the registration.
         params["do_remote_prefill"] = False
+
+        logger.info(f"[PUSH_REG] Stored registration for req {request.request_id}, "
+            f"local_block_ids={local_block_ids}, "
+            f"remote_engine_id={params['remote_engine_id']}")
 
     def request_finished(
         self,
@@ -350,3 +363,21 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         # watchdog so we don't trip an expiration on a fulfilled request.
         for req_id in connector_output.finished_recving or ():
             self._push_registration_deadlines.pop(req_id, None)
+
+
+    # 在 NixlPushConnectorScheduler 类中新增
+
+    def submit_layer_kv(self, req_id: str, layer_idx: int, block_ids: BlockIds):
+        """Scheduler 侧转发给 Worker 的流式传输接口"""
+        # 注意：Scheduler 和 Worker 在不同进程，需要通过某种方式传递。
+        # 最简单的方式：通过 EngineCore 的 request 对象传递，或者直接通过 Connector 的引用。
+        # 这里我们假设有办法拿到 worker 的引用。
+        if self.worker is not None:
+            self.worker.submit_layer_kv(req_id, layer_idx, block_ids)
+
+    
+    # 在 NixlPushConnectorScheduler 中
+    def flush_pending_kv(self, scheduler_output: SchedulerOutput):
+        """转发给 Worker"""
+        if self.worker is not None:
+            self.worker.flush_pending_kv(scheduler_output)

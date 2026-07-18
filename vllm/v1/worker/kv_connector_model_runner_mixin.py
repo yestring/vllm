@@ -23,7 +23,7 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
 )
 from vllm.v1.worker.utils import AttentionGroup
-
+from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 
@@ -249,3 +249,11 @@ class KVConnectorModelRunnerMixin:
                 kv_caches[layer_name] = tensor
 
         return kv_caches, cross_layers_kv_cache, attn_backend
+
+
+    # 在 KVConnectorModelRunnerMixin 类中新增
+    
+    def submit_layer_kv(self, req_id: str, layer_idx: int, block_ids: BlockIds):
+        """GPUModelRunner 通过 mixin 调用 connector"""
+        if self.kv_connector is not None:
+            self.kv_connector.submit_layer_kv(req_id, layer_idx, block_ids)

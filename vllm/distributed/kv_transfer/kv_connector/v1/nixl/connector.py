@@ -20,6 +20,7 @@ from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     EngineId,
     get_current_attn_backend,
+    BlockIds,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     CopyBlocksOp,
@@ -318,6 +319,13 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
         return self.connector_worker.xfer_handshake_metadata
 
 
+    # 在 nixl/connector.py 中
+    
+    def submit_layer_kv(self, req_id: str, layer_idx: int, block_ids: BlockIds):
+        if self.connector_scheduler is not None:
+            self.connector_scheduler.submit_layer_kv(req_id, layer_idx, block_ids)
+
+
 class NixlPullConnector(NixlBaseConnector):
     """Pull-based (READ) NIXL KV transfer connector."""
 
@@ -344,6 +352,12 @@ class NixlPullConnector(NixlBaseConnector):
         assert isinstance(self.connector_worker, NixlPullConnectorWorker)
         assert isinstance(self._connector_metadata, NixlConnectorMetadata)
         self.connector_worker.start_load_kv(self._connector_metadata)
+
+    # 在 nixl/connector.py 中
+
+    def submit_layer_kv(self, req_id: str, layer_idx: int, block_ids: BlockIds):
+        if self.connector_scheduler is not None:
+            self.connector_scheduler.submit_layer_kv(req_id, layer_idx, block_ids)
 
 
 class NixlPushConnector(NixlBaseConnector):
@@ -382,6 +396,17 @@ class NixlPushConnector(NixlBaseConnector):
         self.connector_worker.start_load_kv(self._connector_metadata)
 
 
+    # 在 nixl/connector.py 中
+    
+    def submit_layer_kv(self, req_id: str, layer_idx: int, block_ids: BlockIds):
+        print(f"[CONNECTOR] submit_layer_kv: worker={self.connector_worker}, scheduler={self.connector_scheduler}")
+        if self.connector_worker is not None:
+            self.connector_worker.submit_layer_kv(req_id, layer_idx, block_ids)
+        elif self.connector_scheduler is not None:
+            self.connector_scheduler.submit_layer_kv(req_id, layer_idx, block_ids)
+        else:
+            print("[CONNECTOR] No worker or scheduler!")
+            
 # Backward compatibility: NixlConnector is the pull-based connector.
 NixlConnector = NixlPullConnector
 

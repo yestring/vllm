@@ -1,0 +1,137 @@
+{
+  "timestamp": "2026-07-10T17:24:48.272051",
+  "tests": {
+    "prefix_share_20": {
+      "lru": {
+        "success_rate": 1.0,
+        "throughput": 1507.4887359864745,
+        "ttft_avg": 83.69085788726807,
+        "ttft_p50": 84.16867256164551,
+        "ttft_p95": 96.19951248168945,
+        "ttft_p99": 96.19951248168945,
+        "ttft_std": 7.425757658043431,
+        "tpot_avg": 4.61780309677124,
+        "prefix_hit_rate": 0.6336633663366337,
+        "kv_cache_usage": 0.0,
+        "num_evictions": 0,
+        "ttft_short_avg": 85.8457088470459,
+        "ttft_long_avg": 80.22308349609375,
+        "long_short_ttft_ratio": 0.9345031286191583
+      },
+      "loss_aware": {
+        "success_rate": 1.0,
+        "throughput": 1639.4784694306725,
+        "ttft_avg": 79.90715503692627,
+        "ttft_p50": 80.6797742843628,
+        "ttft_p95": 90.90828895568848,
+        "ttft_p99": 90.90828895568848,
+        "ttft_std": 7.231210681787643,
+        "tpot_avg": 4.204954624176025,
+        "prefix_hit_rate": 0.3696369636963696,
+        "kv_cache_usage": 0.0,
+        "num_evictions": 0,
+        "ttft_short_avg": 81.3438892364502,
+        "ttft_long_avg": 75.07753372192383,
+        "long_short_ttft_ratio": 0.9229646434004238
+      }
+    },
+    "prefix_share_40": {
+      "lru": {
+        "success_rate": 1.0,
+        "throughput": 1737.90597922288,
+        "ttft_avg": 62.43460178375244,
+        "ttft_p50": 62.98196315765381,
+        "ttft_p95": 70.77288627624512,
+        "ttft_p99": 70.77288627624512,
+        "ttft_std": 6.580590404730907,
+        "tpot_avg": 4.205044269561768,
+        "prefix_hit_rate": 0.6486486486486487,
+        "kv_cache_usage": 0.0,
+        "num_evictions": 0,
+        "ttft_short_avg": 59.21506881713867,
+        "ttft_long_avg": 64.41730260848999,
+        "long_short_ttft_ratio": 1.0878532085712216
+      },
+      "loss_aware": {
+        "success_rate": 1.0,
+        "throughput": 1807.0468858920108,
+        "ttft_avg": 50.778865814208984,
+        "ttft_p50": 50.73404312133789,
+        "ttft_p95": 61.1724853515625,
+        "ttft_p99": 61.1724853515625,
+        "ttft_std": 5.994352289184109,
+        "tpot_avg": 4.209227085113525,
+        "prefix_hit_rate": 0.5621621621621622,
+        "kv_cache_usage": 0.0,
+        "num_evictions": 0,
+        "ttft_short_avg": 48.686981201171875,
+        "ttft_long_avg": 51.75215005874634,
+        "long_short_ttft_ratio": 1.0629566422471206
+      }
+    },
+    "prefix_share_60": {
+      "lru": {
+        "success_rate": 1.0,
+        "throughput": 1782.218033515508,
+        "ttft_avg": 55.5699348449707,
+        "ttft_p50": 55.966734886169434,
+        "ttft_p95": 64.4230842590332,
+        "ttft_p99": 64.4230842590332,
+        "ttft_std": 6.462100721532109,
+        "tpot_avg": 4.204265117645264,
+        "prefix_hit_rate": 0.7320261437908496,
+        "kv_cache_usage": 0.0,
+        "num_evictions": 0,
+        "ttft_short_avg": 54.212331771850586,
+        "ttft_long_avg": 55.32824993133545,
+        "long_short_ttft_ratio": 1.0205842125400755
+      },
+      "loss_aware": {
+        "success_rate": 1.0,
+        "throughput": 1753.0142638375273,
+        "ttft_avg": 58.85269641876221,
+        "ttft_p50": 58.82894992828369,
+        "ttft_p95": 67.77501106262207,
+        "ttft_p99": 67.77501106262207,
+        "ttft_std": 5.767274911560304,
+        "tpot_avg": 4.20882511138916,
+        "prefix_hit_rate": 0.6274509803921569,
+        "kv_cache_usage": 0.0,
+        "num_evictions": 0,
+        "ttft_short_avg": 59.15379524230957,
+        "ttft_long_avg": 58.662096659342446,
+        "long_short_ttft_ratio": 0.9916877931339317
+      }
+    },
+    "prefix_share_80": {
+      "lru": {
+        "success_rate": 1.0,
+        "throughput": 1714.2123818141542,
+        "ttft_avg": 66.89708232879639,
+        "ttft_p50": 67.39580631256104,
+        "ttft_p95": 75.8054256439209,
+        "ttft_p99": 75.8054256439209,
+        "ttft_std": 6.536313795618792,
+        "tpot_avg": 4.1984333992004395,
+        "prefix_hit_rate": 0.763302752293578,
+        "kv_cache_usage": 0.0,
+        "num_evictions": 0,
+        "ttft_long_avg": 65.62486290931702
+      },
+      "loss_aware": {
+        "success_rate": 1.0,
+        "throughput": 1717.8716973095181,
+        "ttft_avg": 66.65921211242676,
+        "ttft_p50": 68.02153587341309,
+        "ttft_p95": 75.52099227905273,
+        "ttft_p99": 75.52099227905273,
+        "ttft_std": 6.562548924314438,
+        "tpot_avg": 4.190957069396973,
+        "prefix_hit_rate": 0.7045871559633028,
+        "kv_cache_usage": 0.0,
+        "num_evictions": 0,
+        "ttft_long_avg": 65.17750024795532
+      }
+    }
+  }
+}

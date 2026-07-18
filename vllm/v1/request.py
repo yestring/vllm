@@ -6,7 +6,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any,  Optional
 
 import torch
 
@@ -93,7 +93,7 @@ class Request:
                 reasoning_parser_kwargs
             )
         self.arrival_time = arrival_time if arrival_time is not None else time.time()
-
+        self._cache_info: dict | None = None
         self.status = RequestStatus.WAITING
         self.events: list[EngineCoreEvent] = []
         self.stop_reason: int | str | None = None
@@ -268,6 +268,16 @@ class Request:
 
 
 
+
+
+    @property
+    def cache_info(self):
+        return self._cache_info
+    
+    @cache_info.setter
+    def cache_info(self, value):
+        self._cache_info = value
+
     # vllm/v1/request.py
 
     @property
@@ -283,38 +293,73 @@ class Request:
             return self.num_prompt_tokens - self.num_computed_tokens
         return 1.0
     
-    def utility_score(self, weights: dict, now: float, kv_utilization: float = 0.0) -> float:
+    # vllm/v1/request.py
+
+    def utility_score(
+        self,
+        weights: dict,
+        now: float,
+        cache_info: Optional[dict] = None,
+    ) -> float:
         """
         计算请求的效用值
         
         Args:
             weights: 各维度权重
             now: 当前时间
-            kv_utilization: KV Cache 利用率 (0-1)，用于在高负载时惩罚大请求
+            cache_info: KV Cache 状态信息（从 KVCacheManager 获取），可为 None
         """
+        if cache_info is None:
+            cache_info = {}
+        
+        # 1. 等待时间
         wait = now - self.arrival_time
         wait_score = min(wait / 1.0, 1.0)
+        
+        # 2. 优先级
         priority_score = 1.0 - (self.priority / 9.0)
+        
+        # 3. KV Cache 命中收益（默认 0）
+        kv_benefit = 0.0
+        if cache_info:
+            hit_rate = cache_info.get('hit_rate', 0.0)
+            kv_util = cache_info.get('kv_utilization', 0.0)
+            kv_benefit = hit_rate * (1.0 - kv_util * 0.3)
+        
+        # 4. Decode 稳定性
+        is_decode = self.num_computed_tokens >= self.num_prompt_tokens
+        decode_stability = 1.0 if is_decode else 0.0
+        
+        # 5. 碎片化惩罚
+        frag_penalty = 0.0
+        if cache_info:
+            kv_util = cache_info.get('kv_utilization', 0.0)
+            remaining_blocks = cache_info.get('total_blocks_needed', 0) - cache_info.get('computed_blocks', 0)
+            if kv_util > 0.7 and remaining_blocks > 0:
+                frag_penalty = (remaining_blocks / 100.0) * (kv_util - 0.7) * 5.0
+                frag_penalty = min(frag_penalty, 1.0)
+        
+        # 6. 短请求奖励（如果不想用，权重调低）
         short_score = 1.0 / (1.0 + math.log(self.num_prompt_tokens + 1))
-        fair_score = 1.0 + self.num_preemptions * 0.2
+        
+        # 7. 多模态惩罚
         mm_penalty = 0.3 if self.has_encoder_inputs else 0.0
         
-        # ---- 新增：KV Cache 感知惩罚 ----
-        # 当 KV Cache 使用率超过 80% 时，惩罚需要大量新 KV 块的请求
-        kv_penalty = 0.0
-        if kv_utilization > 0.8:
-            # 剩余需要计算的 Token 数越多，惩罚越大
-            remaining_tokens = self.num_tokens - self.num_computed_tokens
-            kv_penalty = (remaining_tokens / 1000.0) * (kv_utilization - 0.8) * 10.0
+        # 8. 公平性（被抢占次数越多，权重越高）
+        fair_score = 1.0 + self.num_preemptions * 0.2
         
-        utility = (weights.get('wait', 0.4) * wait_score +
-                   weights.get('priority', 0.3) * priority_score +
-                   weights.get('short', 0.15) * short_score +   # 降低短请求权重
-                   weights.get('fair', 0.15) * fair_score -     # 增加公平性权重
-                   weights.get('mm', 0.1) * mm_penalty -
-                   kv_penalty)  # 新增 KV 惩罚
-        
-        return max(utility, 0.0)
+        # 加权组合
+        utility = (
+            weights.get('wait', 0.30) * wait_score +
+            weights.get('priority', 0.15) * priority_score +
+            weights.get('kv_benefit', 0.30) * kv_benefit +
+            weights.get('decode_stability', 0.15) * decode_stability +
+            weights.get('short', 0.05) * short_score +
+            weights.get('fair', 0.10) * fair_score -
+            weights.get('frag_penalty', 0.10) * frag_penalty -
+            weights.get('mm_penalty', 0.05) * mm_penalty
+        )
+        return max(utility, 0.1)
 
     
     def get_skip_reading_prefix_cache(self) -> bool:

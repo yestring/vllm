@@ -648,6 +648,9 @@ class EngineArgs:
     jit_monitor_verbose: bool = ObservabilityConfig.jit_monitor_verbose
     enable_mm_processor_stats: bool = ObservabilityConfig.enable_mm_processor_stats
     scheduling_policy: SchedulerPolicy = SchedulerConfig.policy
+    # ===== 你的参数 =====
+
+    enable_loss_eviction: bool = False
     scheduler_cls: str | type[object] | None = SchedulerConfig.scheduler_cls
 
     pooler_config: PoolerConfig | None = ModelConfig.pooler_config
@@ -1433,6 +1436,13 @@ class EngineArgs:
                 "choices": ["fcfs", "priority", "utility"],  # 显式指定可选值
             }
         )
+        # ===== 你的参数 =====
+        scheduler_group.add_argument(
+            "--enable-loss-eviction",
+            action="store_true",
+            default=False,
+            help="Enable Loss-aware KV Cache eviction policy",
+        )
         scheduler_group.add_argument(
             "--enable-chunked-prefill",
             **{
@@ -1466,19 +1476,6 @@ class EngineArgs:
             "--stream-interval", **scheduler_kwargs["stream_interval"]
         )
 
-        # ========== 新增：调度器优化参数 ==========
-        scheduler_group.add_argument(
-            "--stable-window", **scheduler_kwargs["stable_window"]
-        )
-        scheduler_group.add_argument(
-            "--max-candidates", **scheduler_kwargs["max_candidates"]
-        )
-        scheduler_group.add_argument(
-            "--high-load-threshold", **scheduler_kwargs["high_load_threshold"]
-        )
-        scheduler_group.add_argument(
-            "--kv-util-threshold", **scheduler_kwargs["kv_util_threshold"]
-        )
 
 
         
@@ -2171,6 +2168,7 @@ class EngineArgs:
             is_multimodal_model=model_config.is_multimodal_model,
             is_encoder_decoder=model_config.is_encoder_decoder,
             policy=self.scheduling_policy,
+            enable_loss_eviction=self.enable_loss_eviction,  # ← 新增
             scheduler_cls=self.scheduler_cls,
             max_num_partial_prefills=self.max_num_partial_prefills,
             max_long_partial_prefills=self.max_long_partial_prefills,

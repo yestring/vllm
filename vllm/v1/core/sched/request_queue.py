@@ -6,7 +6,8 @@ from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Iterable, Iterator
 from enum import Enum
-
+from vllm.logger import init_logger
+logger = init_logger(__name__)
 from vllm.v1.request import Request
 
 

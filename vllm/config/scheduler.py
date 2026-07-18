@@ -39,19 +39,20 @@ class SchedulerConfig:
     disable chunked prefill and prefix caching for encoder-decoder models.
     """
 
-    # ========== 新增：调度器优化选项 ==========
-    stable_window: int = Field(default=10, ge=1)
-    """Batch 稳定性窗口：保持 Batch 组成不变的步数"""
-    
-    max_candidates: int = Field(default=64, ge=1)
-    """Utility 调度时考虑的最大候选请求数"""
-    
-    high_load_threshold: int = Field(default=32, ge=1)
-    """判断高负载的 running 请求数阈值"""
-    
-    kv_util_threshold: float = Field(default=0.85, ge=0.0, le=1.0)
-    """KV Cache 使用率阈值，超过后切换策略"""
 
+    enable_loss_eviction: bool = False
+
+     # Step 5: 反馈控制参数
+    enable_feedback_control: bool = True
+    weights_update_interval: int = 20
+    initial_weights: dict = Field(default_factory=lambda: {
+        'wait': 0.30,
+        'kv_benefit': 0.30,
+        'decode_stability': 0.15,
+        'priority': 0.10,
+        'frag_penalty': 0.10,
+        'mm_penalty': 0.05,
+    })
 
     
 

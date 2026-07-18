@@ -273,3 +273,8 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             tp_size=self.vllm_config.parallel_config.tensor_parallel_size,
             remote_num_tokens=remote_num_tokens,
         )
+
+
+    def submit_layer_kv(self, req_id: str, layer_idx: int, block_ids: BlockIds):
+        if self.worker is not None:
+            self.worker.submit_layer_kv(req_id, layer_idx, block_ids)
