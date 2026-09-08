@@ -37,8 +37,9 @@ from typing import TYPE_CHECKING, Any
 
 import msgspec
 import numpy as np
+import torch
 
-from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
+from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds, EngineId
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
     NixlBaseConnectorWorker,
 )
@@ -55,8 +56,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import get_base_req
 from vllm.logger import init_logger
 
 if TYPE_CHECKING:
-    import torch
-
     from vllm.config import VllmConfig
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
@@ -99,6 +98,9 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         # Cross-thread channels.
         self._reg_send_inbox: queue.Queue[tuple[str, dict[str, Any]]] = queue.Queue()
         self._finished_blocks_inbox: queue.Queue[tuple[str, BlockIds]] = queue.Queue()
+        self._layer_ready_inbox: queue.Queue[
+            tuple[str, str, BlockIds, torch.cuda.Event | None]
+        ] = queue.Queue()
         self._pending_completion_notifs: queue.Queue[bytes] = queue.Queue()
         # Main thread → writer: req_ids whose lease has expired or whose
         # WRITE has completed. Writer drops them from
@@ -113,9 +115,26 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
 
         self._push_writer_stop = threading.Event()
         self._push_writer_thread: threading.Thread | None = None
+        self.enable_layerwise_transfer = bool(
+            self.kv_transfer_config.get_from_extra_config(
+                "enable_layerwise_transfer", False
+            )
+        )
+        self._pending_layer_chunks: dict[
+            ReqId,
+            dict[str, tuple[BlockIds, torch.cuda.Event | None]],
+        ] = defaultdict(dict)
+        self._failed_layerwise_requests: set[ReqId] = set()
+        self._layerwise_completion_targets: dict[
+            ReqId, tuple[EngineId, ReqId]
+        ] = {}
+        # A request is complete only after every registered attention layer
+        # has been submitted and all of its WRITE handles have completed.
+        # Without this barrier, a fast early-layer WRITE can temporarily empty
+        # ``_sending_transfers`` and be mistaken for whole-request completion.
+        self._layerwise_submitted_layers: dict[ReqId, set[str]] = defaultdict(set)
+        self._layerwise_fully_submitted_requests: set[ReqId] = set()
 
-
-        self._submitted_layers = set()  # 记录已提交的层，避免重复
     # --- Lifecycle ----------------------------------------------------- #
 
     def register_kv_caches(self, kv_caches: dict[str, "torch.Tensor"]):
@@ -189,11 +208,36 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         # Heartbeats still leave from the main thread (base worker behaviour).
         self._send_heartbeats(metadata)
 
+    def save_kv_layer(
+        self,
+        metadata: NixlConnectorMetadata,
+        layer_name: str,
+    ) -> None:
+        """Queue one ready KV layer for asynchronous NIXL WRITE."""
+        
+        if not self.enable_layerwise_transfer or not metadata.reqs_to_save:
+            return
+        if layer_name not in self.layer_name_to_region_ids:
+            raise NotImplementedError(
+                "Layerwise NIXL push requires a dedicated registered region "
+                f"for {layer_name!r}"
+            )
+
+        ready_event: torch.cuda.Event | None = None
+        if torch.cuda.is_available():
+            ready_event = torch.cuda.Event()
+            ready_event.record(torch.cuda.current_stream())
+
+        for req_id, meta in metadata.reqs_to_save.items():
+            self._layer_ready_inbox.put(
+                (req_id, layer_name, meta.local_block_ids, ready_event)
+            )
+        self._push_writer_wake.set()
+
     # --- Writer thread ------------------------------------------------- #
 
     def _push_writer_loop(self) -> None:
         sleep_s = _PUSH_WRITER_POLL_INTERVAL_MS / 1000.0
-    
         while not self._push_writer_stop.is_set():
             try:
                 # 1. D registrations to send.
@@ -203,54 +247,44 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                     except queue.Empty:
                         break
                     self._send_registration_to_p(rid, rd)
-    
                 # 2. P-side finished blocks; match against pending regs.
-                # ============================================================
-                # 修改点：支持三元组 (rid, blocks, layer_idx)
-                # ============================================================
                 while True:
                     try:
-                        item = self._finished_blocks_inbox.get_nowait()
+                        rid, blocks = self._finished_blocks_inbox.get_nowait()
                     except queue.Empty:
                         break
-                    logger.info(f"[STREAMING] writer got item: {item}")
-                    # 解析 item：支持二元组或三元组
-                    if len(item) == 3:
-                        rid, blocks, layer_idx = item
-                    else:
-                        rid, blocks = item
-                        layer_idx = None
-                    
-                    # 检查是否有匹配的 D 端注册
                     matched = self._pop_matching_registration(rid)
                     if matched is not None:
-                        # 有注册：立即发送
                         self._do_start_push_kv(rid, blocks, matched)
                     else:
-                        # 无注册：暂存等待
-                        # 如果是逐层传输，需要合并同一请求的多个块
-                        if rid in self._push_finished_blocks:
-                            existing = self._push_finished_blocks[rid]
-                            # 提取第一个 group 的 block_ids（都是 list）
-                            existing_list = existing[0] if existing and isinstance(existing, tuple) else existing
-                            blocks_list = blocks[0] if blocks and isinstance(blocks, tuple) else blocks
-                            if isinstance(existing_list, list) and isinstance(blocks_list, list):
-                                merged_list = list(set(existing_list + blocks_list))
-                                self._push_finished_blocks[rid] = (merged_list,)
-                            else:
-                                # 如果结构不一致，直接覆盖
-                                self._push_finished_blocks[rid] = blocks
-                        else:
-                            self._push_finished_blocks[rid] = blocks
-                        
-                        # 记录已提交的层，防止重复提交
-                        if layer_idx is not None:
-                            key = f"{rid}:{layer_idx}"
-                            self._submitted_layers.add(key)
-    
+                        self._push_finished_blocks[rid] = blocks
+
+                while True:
+                    try:
+                        rid, layer_name, blocks, ready_event = (
+                            self._layer_ready_inbox.get_nowait()
+                        )
+                    except queue.Empty:
+                        break
+                    registration = self._peek_matching_registration(rid)
+                    if registration is None:
+                        self._pending_layer_chunks[rid][layer_name] = (
+                            blocks,
+                            ready_event,
+                        )
+                        continue
+                    self._do_start_layer_push(
+                        rid,
+                        layer_name,
+                        blocks,
+                        ready_event,
+                        registration,
+                    )
+
                 # 2b. Evict finished blocks for requests that have either
                 # completed (WRITE acknowledged) or whose lease expired
-                # without a D registration.
+                # without a D registration.  Drop pending registrations
+                # for the same reason so we don't leak state.
                 while True:
                     try:
                         rid = self._evict_finished_inbox.get_nowait()
@@ -258,22 +292,26 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                         break
                     self._push_finished_blocks.pop(rid, None)
                     self._pending_d_registrations.pop(rid, None)
-                    # 清理已提交的层记录
-                    self._submitted_layers = {k for k in self._submitted_layers if not k.startswith(f"{rid}:")}
-    
+                    self._pending_layer_chunks.pop(rid, None)
+                    self._failed_layerwise_requests.discard(rid)
+                    self._layerwise_completion_targets.pop(rid, None)
+                    self._layerwise_submitted_layers.pop(rid, None)
+                    with self._sending_transfers_lock:
+                        self._layerwise_fully_submitted_requests.discard(rid)
+
                 # 3. NIXL notifs: route PUSH_REG; forward the rest.
                 for notifs in self.nixl_wrapper.get_new_notifs().values():
                     for notif in notifs:
                         if notif.startswith(PUSH_REG_NOTIF_PREFIX):
                             self._handle_push_reg_notif(notif)
-                        else:
+                        elif notif:
                             self._pending_completion_notifs.put(notif)
             except Exception:
                 logger.exception("nixl-push-writer error; continuing")
-    
             # Self-poll only while there is no other wake source: P-side
-            # finished blocks waiting for a D PUSH_REG match.
-            if self._push_finished_blocks:
+            # finished blocks waiting for a D PUSH_REG match. All other
+            # progress is event-driven (see module docstring).
+            if self._push_finished_blocks or self._pending_layer_chunks:
                 self._push_writer_stop.wait(timeout=sleep_s)
             else:
                 self._push_writer_wake.wait()
@@ -296,6 +334,17 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             self._do_start_push_kv(fin_id, blocks, reg_data)
         else:
             self._pending_d_registrations[rid] = reg_data
+            pending = self._pop_matching_layer_chunks(rid)
+            if pending is not None:
+                fin_id, chunks = pending
+                for layer_name, (blocks, ready_event) in chunks.items():
+                    self._do_start_layer_push(
+                        fin_id,
+                        layer_name,
+                        blocks,
+                        ready_event,
+                        reg_data,
+                    )
 
     # --- D-side registration send (writer thread) ---------------------- #
 
@@ -383,6 +432,33 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 return self._pending_d_registrations.pop(reg_id)
         return None
 
+    def _peek_matching_registration(
+        self, request_id: str
+    ) -> dict[str, Any] | None:
+        data = self._pending_d_registrations.get(request_id)
+        if data is not None:
+            return data
+        base_id = get_base_request_id(request_id)
+        for reg_id, reg_data in self._pending_d_registrations.items():
+            if get_base_request_id(reg_id) == base_id:
+                return reg_data
+        return None
+
+    def _pop_matching_layer_chunks(
+        self, request_id: str
+    ) -> tuple[
+        str,
+        dict[str, tuple[BlockIds, torch.cuda.Event | None]],
+    ] | None:
+        chunks = self._pending_layer_chunks.pop(request_id, None)
+        if chunks is not None:
+            return request_id, chunks
+        base_id = get_base_request_id(request_id)
+        for pending_id in list(self._pending_layer_chunks):
+            if get_base_request_id(pending_id) == base_id:
+                return pending_id, self._pending_layer_chunks.pop(pending_id)
+        return None
+
     def _pop_matching_finished_blocks(
         self, request_id: str
     ) -> tuple[str, BlockIds] | None:
@@ -407,6 +483,8 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         request_id: str,
         local_block_ids: BlockIds,
         registration_data: dict[str, Any],
+        layer_name: str | None = None,
+        notify_remote: bool = True,
     ) -> None:
         """Start push-based KV transfer from P worker to D node.
 
@@ -456,7 +534,12 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         )
 
         t0 = time.perf_counter()
-        self._xfer_blocks_for_req(req_id=request_id, meta=push_meta)
+        self._xfer_blocks_for_req(
+            req_id=request_id,
+            meta=push_meta,
+            layer_name=layer_name,
+            notify_remote=notify_remote,
+        )
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
         if elapsed_ms > 200.0:
             logger.warning(
@@ -464,6 +547,36 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 request_id,
                 elapsed_ms,
             )
+
+    def _do_start_layer_push(
+        self,
+        request_id: str,
+        layer_name: str,
+        local_block_ids: BlockIds,
+        ready_event: torch.cuda.Event | None,
+        registration_data: dict[str, Any],
+    ) -> None:
+        if ready_event is not None:
+            ready_event.synchronize()
+        if not self.layer_name_to_region_ids:
+            raise RuntimeError("NIXL KV cache regions are not registered")
+        self._layerwise_completion_targets[request_id] = (
+            registration_data["decode_engine_id"],
+            registration_data["request_id"],
+        )
+        self._layerwise_submitted_layers[request_id].add(layer_name)
+        self._do_start_push_kv(
+            request_id,
+            local_block_ids,
+            registration_data,
+            layer_name=layer_name,
+            notify_remote=False,
+        )
+        if self._layerwise_submitted_layers[request_id] == set(
+            self.layer_name_to_region_ids
+        ):
+            with self._sending_transfers_lock:
+                self._layerwise_fully_submitted_requests.add(request_id)
 
     def _ensure_d_handshake(
         self,
@@ -516,7 +629,13 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             return (list(block_ids),)
         return block_ids
 
-    def _xfer_blocks_for_req(self, req_id: str, meta: ReqMeta):
+    def _xfer_blocks_for_req(
+        self,
+        req_id: str,
+        meta: ReqMeta,
+        layer_name: str | None = None,
+        notify_remote: bool = True,
+    ):
         """Issue WRITE transfers to one or more remote TP ranks."""
         assert meta.remote is not None and self.transfer_topo is not None
         engine_id = meta.remote.engine_id
@@ -585,9 +704,11 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 remote_request_id=meta.remote.request_id,
                 local_xfer_side_handle=local_xfer_side_handle,
                 remote_xfer_side_handle=remote_xfer_side_handle,
+                layer_name=layer_name,
+                notify_remote=notify_remote,
             )
 
-        if self.use_mla and tp_ratio < 0 and read_specs:
+        if self.use_mla and tp_ratio < 0 and read_specs and notify_remote:
             notif_id = f"{meta.remote.request_id}:{self.world_size}".encode()
             remote_agents = self._remote_agents[meta.remote.engine_id]
             for rank_to_notify, agent in remote_agents.items():
@@ -602,6 +723,8 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         remote_request_id: str,
         local_xfer_side_handle: int,
         remote_xfer_side_handle: int,
+        layer_name: str | None = None,
+        notify_remote: bool = True,
     ):
         """Post a WRITE point-to-point xfer request."""
         assert self.transfer_topo is not None
@@ -627,7 +750,11 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             local_block_ids = [local_block_ids_mapped] if local_block_ids_mapped else []
             remote_block_ids = [remote_block_ids0]
 
-        notif_id = f"{remote_request_id}:{self.world_size}".encode()
+        notif_id = (
+            f"{remote_request_id}:{self.world_size}".encode()
+            if notify_remote
+            else b""
+        )
 
         if len(local_block_ids) == 0:
             logger.warning("No blocks to push for request %s", request_id)
@@ -645,20 +772,55 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 remote_block_ids[i] = remote_block_ids[i][:num_local]
 
         # Get descs ids.
-        remote_block_descs_ids = self._compute_desc_ids(
-            block_ids=remote_block_ids,
-            dst_num_blocks=self.dst_num_blocks[dst_engine_id],
-            block_size_ratio=None,
-            physical_blocks_per_logical=remote_info.remote_physical_blocks_per_logical,
-        )
-        local_block_descs_ids = self._compute_desc_ids(
-            block_ids=local_block_ids,
-            dst_num_blocks=self.dst_num_blocks[self.engine_id],
-            block_size_ratio=block_size_ratio,
-            physical_blocks_per_logical=self._physical_blocks_per_logical_kv_block,
-        )
+        if layer_name is None:
+            remote_block_descs_ids = self._compute_desc_ids(
+                block_ids=remote_block_ids,
+                dst_num_blocks=self.dst_num_blocks[dst_engine_id],
+                block_size_ratio=None,
+                physical_blocks_per_logical=(
+                    remote_info.remote_physical_blocks_per_logical
+                ),
+            )
+            local_block_descs_ids = self._compute_desc_ids(
+                block_ids=local_block_ids,
+                dst_num_blocks=self.dst_num_blocks[self.engine_id],
+                block_size_ratio=block_size_ratio,
+                physical_blocks_per_logical=(
+                    self._physical_blocks_per_logical_kv_block
+                ),
+            )
+        else:
+            if block_size_ratio not in (None, 1):
+                raise NotImplementedError(
+                    "Layerwise NIXL push requires equal P/D block sizes"
+                )
+            region_ids = self.layer_name_to_region_ids[layer_name]
+            remote_block_descs_ids = self._compute_layer_desc_ids(
+                remote_block_ids,
+                self.dst_num_blocks[dst_engine_id],
+                region_ids,
+            )
+            local_block_descs_ids = self._compute_layer_desc_ids(
+                local_block_ids,
+                self.dst_num_blocks[self.engine_id],
+                region_ids,
+            )
 
-        assert len(local_block_descs_ids) == len(remote_block_descs_ids)
+        num_local_descs = len(local_block_descs_ids)
+        num_remote_descs = len(remote_block_descs_ids)
+        if num_local_descs == 0 and num_remote_descs == 0:
+            logger.debug(
+                "Skipping empty KV push for request %s, layer %s",
+                request_id,
+                layer_name,
+            )
+            return
+        if num_local_descs != num_remote_descs:
+            raise RuntimeError(
+                "NIXL push descriptor count mismatch for "
+                f"{request_id}: local={num_local_descs}, "
+                f"remote={num_remote_descs}, layer={layer_name}"
+            )
 
         handle = None
         try:
@@ -690,6 +852,8 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             if handle is not None:
                 self.nixl_wrapper.release_xfer_handle(handle)
             self.xfer_stats.record_failed_transfer()
+            if layer_name is not None:
+                self._failed_layerwise_requests.add(request_id)
 
     # --- Notification handling on engine main thread ------------------ #
 
@@ -759,10 +923,56 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         # writer thread also appends to it, so guard the pop.
         with self._sending_transfers_lock:
             done_pushing = self._pop_done_transfers(self._sending_transfers)
+            fully_submitted = set(self._layerwise_fully_submitted_requests)
+            done_pushing.update(
+                req_id
+                for req_id in fully_submitted
+                if req_id not in self._sending_transfers
+            )
         for req_id in done_pushing:
+            submitted_layers = self._layerwise_submitted_layers.get(req_id)
+            if submitted_layers is not None and req_id not in fully_submitted:
+                logger.debug(
+                    "Layerwise transfers currently drained for %s after %d/%d "
+                    "layers; waiting for the remaining layers",
+                    req_id,
+                    len(submitted_layers),
+                    len(self.layer_name_to_region_ids),
+                )
+                continue
+
+            target = self._layerwise_completion_targets.pop(req_id, None)
+            if (
+                target is not None
+                and req_id not in self._failed_layerwise_requests
+            ):
+                logger.info(
+                    "Layerwise transfer completed for %s, sending notification",
+                    req_id,
+                )
+                dst_engine_id, remote_request_id = target
+                notif = f"{remote_request_id}:{self.world_size}".encode()
+                plan = self.tp_mappings[dst_engine_id]
+                agents = self._remote_agents[dst_engine_id]
+                for remote_rank in plan.all_source_ranks:
+                    try:
+                        self.nixl_wrapper.send_notif(
+                            agents[remote_rank], notif_msg=notif
+                        )
+                    except Exception as e:
+                        self._log_failure(
+                            failure_type="layerwise_completion_notif_failed",
+                            req_id=req_id,
+                            error=e,
+                            remote_rank=remote_rank,
+                        )
+                        self.xfer_stats.record_failed_notification()
             self._reqs_to_send.pop(req_id, None)
             self._reqs_to_process.discard(req_id)
             self.consumer_notification_counts_by_req.pop(req_id, None)
+            self._layerwise_submitted_layers.pop(req_id, None)
+            with self._sending_transfers_lock:
+                self._layerwise_fully_submitted_requests.discard(req_id)
             done_sending.add(req_id)
 
         # Tell the writer to drop any state it still holds for any
@@ -774,18 +984,3 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             self._push_writer_wake.set()
 
         return done_sending, done_recving
-
-
-
-    def submit_layer_kv(self, req_id: str, layer_idx: int, block_ids: BlockIds):
-        logger.info(f"[STREAMING] submit_layer_kv: req={req_id}, layer={layer_idx}, block_ids={block_ids}")
-        if not block_ids:
-            return
-        key = f"{req_id}:{layer_idx}"
-        if key in self._submitted_layers:
-            logger.info(f"[STREAMING] layer {layer_idx} already submitted, skipping")
-            return
-        self._submitted_layers.add(key)
-        self._finished_blocks_inbox.put((req_id, block_ids, layer_idx))
-        self._push_writer_wake.set()
-        logger.info(f"[STREAMING] queued layer {layer_idx} for req {req_id}")

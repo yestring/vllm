@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 RunnerType = Literal["generate", "pooling", "draft"]
-SchedulerPolicy = Literal["fcfs", "priority","utility"]
+SchedulerPolicy = Literal["fcfs", "priority", "utility"]
 
 
 @config
@@ -41,20 +41,22 @@ class SchedulerConfig:
 
 
     enable_loss_eviction: bool = False
+    """Use cost-aware prefix-cache eviction instead of LRU."""
 
-     # Step 5: 反馈控制参数
     enable_feedback_control: bool = True
     weights_update_interval: int = 20
-    initial_weights: dict = Field(default_factory=lambda: {
-        'wait': 0.30,
-        'kv_benefit': 0.30,
-        'decode_stability': 0.15,
-        'priority': 0.10,
-        'frag_penalty': 0.10,
-        'mm_penalty': 0.05,
-    })
-
-    
+    initial_weights: dict[str, float] = Field(
+        default_factory=lambda: {
+            "wait": 0.30,
+            "kv_benefit": 0.25,
+            "decode_stability": 0.10,
+            "priority": 0.10,
+            "short": 0.10,
+            "fair": 0.10,
+            "frag_penalty": 0.03,
+            "mm_penalty": 0.02,
+        }
+    )
 
 
     DEFAULT_MAX_NUM_BATCHED_TOKENS: ClassVar[int] = 2048

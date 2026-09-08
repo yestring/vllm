@@ -1,13 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import time
 import heapq
 from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Iterable, Iterator
+from contextlib import suppress
 from enum import Enum
-from vllm.logger import init_logger
-logger = init_logger(__name__)
+
 from vllm.v1.request import Request
 
 
@@ -204,79 +203,47 @@ class PriorityRequestQueue(RequestQueue):
 # vllm/v1/core/sched/request_queue.py
 
 class UtilityRequestQueue(RequestQueue):
-    """
-    Utility-driven request queue.
+    """Request storage for utility scheduling.
 
-    Orders requests by a dynamically computed utility score.
-    Since utility depends on waiting time (which changes every step),
-    we reorder the entire list on each pop/peek operation.
-
-    The utility is computed via `Request.utility_score(weights, now)`.
+    Utility depends on scheduler-owned state such as KV-cache pressure and
+    therefore is evaluated by ``Scheduler.schedule``. The queue deliberately
+    preserves every request and insertion order; it must never discard requests
+    as an optimization.
     """
 
-    def __init__(self, utility_weights: dict | None = None, top_k: int = 32):
+    def __init__(self):
         self._requests: list[Request] = []
-        self._weights = utility_weights or {}
-        self._top_k = top_k  # 新增：Top-K 限制
-    
-    def _reorder(self) -> None:
-        """重排序，只保留 Top-K 个最高 Utility 的请求"""
-        if not self._requests:
-            return
-        now = time.monotonic()
-        # 按 utility 降序排序，只取前 top_k 个
-        self._requests.sort(
-            key=lambda req: req.utility_score(self._weights, now),
-            reverse=True
-        )
-        if len(self._requests) > self._top_k:
-            self._requests = self._requests[:self._top_k]
-
 
     def add_request(self, request: Request) -> None:
-        """Add a request to the queue."""
         self._requests.append(request)
 
     def pop_request(self) -> Request:
-        """Pop the request with the highest utility."""
         if not self._requests:
             raise IndexError("pop from empty utility queue")
-        self._reorder()
         return self._requests.pop(0)
 
     def peek_request(self) -> Request:
-        """Peek at the request with the highest utility without removing it."""
         if not self._requests:
             raise IndexError("peek from empty utility queue")
-        self._reorder()
         return self._requests[0]
 
     def prepend_request(self, request: Request) -> None:
-        """
-        Prepend a request to the front of the queue.
-        In utility ordering, "prepend" has no strict meaning because
-        ordering is determined by utility. We simply add it to the list;
-        the next reorder will place it correctly.
-        """
-        self._requests.append(request)
+        self._requests.insert(0, request)
 
     def prepend_requests(self, requests: RequestQueue) -> None:
-        """Prepend all requests from another queue (same as add)."""
-        for req in requests:
-            self._requests.append(req)
+        self._requests[0:0] = list(requests)
 
     def remove_request(self, request: Request) -> None:
         """Remove a specific request from the queue."""
-        try:
+        with suppress(ValueError):
             self._requests.remove(request)
-        except ValueError:
-            # Request not found; silently ignore
-            pass
 
     def remove_requests(self, requests: Iterable[Request]) -> None:
         """Remove multiple specific requests from the queue."""
         requests_to_remove = set(requests)
-        self._requests = [req for req in self._requests if req not in requests_to_remove]
+        self._requests = [
+            req for req in self._requests if req not in requests_to_remove
+        ]
 
     def __bool__(self) -> bool:
         return bool(self._requests)
@@ -285,19 +252,7 @@ class UtilityRequestQueue(RequestQueue):
         return len(self._requests)
 
     def __iter__(self) -> Iterator[Request]:
-        """
-        Iterate over requests in utility order (highest first) without
-        modifying the queue.
-        """
-        if not self._requests:
-            return iter([])
-        now = time.monotonic()
-        sorted_copy = sorted(
-            self._requests,
-            key=lambda req: req.utility_score(self._weights, now),
-            reverse=True
-        )
-        return iter(sorted_copy)
+        return iter(self._requests)
 
 
 
@@ -306,11 +261,8 @@ def create_request_queue(policy: SchedulingPolicy) -> RequestQueue:
     """Create request queue based on scheduling policy."""
     if policy == SchedulingPolicy.PRIORITY:
         return PriorityRequestQueue()
-    elif policy == SchedulingPolicy.FCFS:
+    if policy == SchedulingPolicy.FCFS:
         return FCFSRequestQueue()
-    elif policy == SchedulingPolicy.UTILITY:
-        # You can pass utility_weights via a global config; here we use defaults.
-        # In practice, you'd want to read weights from SchedulerConfig.
+    if policy == SchedulingPolicy.UTILITY:
         return UtilityRequestQueue()
-    else:
-        raise ValueError(f"Unknown scheduling policy: {policy}")
+    raise ValueError(f"Unknown scheduling policy: {policy}")

@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
-import time
 import math
-
+import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import replace
@@ -106,69 +105,35 @@ class Scheduler(SchedulerInterface):
 
 
 
-        # 在 __init__ 中
-        if hasattr(self.scheduler_config, 'initial_weights'):
-            self.weights = self.scheduler_config.initial_weights.copy()
-            self.utility_weights = self.weights
-        
-        if hasattr(self.scheduler_config, 'weights_update_interval'):
-            self.WEIGHTS_UPDATE_INTERVAL = self.scheduler_config.weights_update_interval
-        
-        if hasattr(self.scheduler_config, 'enable_feedback_control'):
-            self.enable_feedback_control = self.scheduler_config.enable_feedback_control
-        else:
-            self.enable_feedback_control = True
-            
-        # ========== 新增：Batch 稳定性控制 ==========
-        self.stable_batch_counter = 0
-        self.STABLE_WINDOW = 10  # 保持 10 步不变
-        self.previous_batch_req_ids = set()
-        
-        # ========== 新增：自适应切换相关 ==========
-        self.utility_enabled = True
-        self.consecutive_high_load_steps = 0
-        self.HIGH_LOAD_THRESHOLD = 32  # running > 32 视为高负载
-
-        self.utility_weights = {
-            'wait': 0.30,
-            'kv_benefit': 0.30,
-            'decode_stability': 0.15,
-            'priority': 0.10,
-            'frag_penalty': 0.10,
-            'mm_penalty': 0.05,
-        }
-        self.weights = self.utility_weights  # 也可以统一命名
-
-
-        # 2. EWMA 平滑状态（指数加权移动平均）
-        self.ewma_ttft_ms = 40.0      # 初始估计，后续会收敛
-        self.ewma_throughput = 1000.0 # 初始估计
-        self.ewma_alpha = 0.1          # 平滑因子（越小越平滑）
-        
-        # 3. 反馈控制参数
+        self.weights = self.scheduler_config.initial_weights.copy()
+        self.utility_weights = self.weights
+        self.enable_feedback_control = (
+            self.scheduler_config.enable_feedback_control
+        )
         self.weights_update_counter = 0
-        self.WEIGHTS_UPDATE_INTERVAL = 20  # 每 20 步更新一次
+        self.WEIGHTS_UPDATE_INTERVAL = (
+            self.scheduler_config.weights_update_interval
+        )
         self.min_weights = {
-            'wait': 0.10,
-            'kv_benefit': 0.10,
-            'decode_stability': 0.05,
-            'priority': 0.05,
-            'frag_penalty': 0.02,
-            'mm_penalty': 0.02,
+            "wait": 0.10,
+            "kv_benefit": 0.05,
+            "decode_stability": 0.02,
+            "priority": 0.02,
+            "short": 0.02,
+            "fair": 0.05,
+            "frag_penalty": 0.01,
+            "mm_penalty": 0.0,
         }
         self.max_weights = {
-            'wait': 0.50,
-            'kv_benefit': 0.55,
-            'decode_stability': 0.35,
-            'priority': 0.25,
-            'frag_penalty': 0.25,
-            'mm_penalty': 0.15,
+            "wait": 0.50,
+            "kv_benefit": 0.50,
+            "decode_stability": 0.25,
+            "priority": 0.25,
+            "short": 0.25,
+            "fair": 0.30,
+            "frag_penalty": 0.20,
+            "mm_penalty": 0.15,
         }
-        
-        # 4. 性能指标滑动窗口（用于计算实际 TTFT）
-        self.recent_ttfts = []  # 最近 N 个请求的 TTFT（毫秒）
-        self.recent_throughputs = []  # 最近 N 步的吞吐
-        self.MAX_SAMPLES = 50
 
         self.enable_loss_eviction = self.scheduler_config.enable_loss_eviction
 
@@ -472,27 +437,7 @@ class Scheduler(SchedulerInterface):
 
 
     def _should_use_utility(self) -> bool:
-        if self.policy != SchedulingPolicy.UTILITY:
-            return False
-    
-        running_len = len(self.running)
-        queue_len = len(self.waiting) + len(self.skipped_waiting)
-    
-        kv_usage = self.kv_cache_manager.usage
-    
-        if (running_len > self.HIGH_LOAD_THRESHOLD
-                or queue_len > 100
-                or kv_usage > self.KV_UTIL_THRESHOLD):
-    
-            self.consecutive_high_load_steps += 1
-    
-            if self.consecutive_high_load_steps >= 5:
-                return False
-    
-        else:
-            self.consecutive_high_load_steps = 0
-    
-        return True
+        return self.policy == SchedulingPolicy.UTILITY
     
     def _get_kv_utilization(self) -> float:
         return self.kv_cache_manager.usage
@@ -524,25 +469,51 @@ class Scheduler(SchedulerInterface):
         
         # 规则 1：队列深度过大 → 提升 wait 权重
         if queue_len > 20:
-            self.weights['wait'] = min(self.max_weights['wait'], self.weights['wait'] + 0.01)
+            self.weights["wait"] = min(
+                self.max_weights["wait"], self.weights["wait"] + 0.01
+            )
         elif queue_len < 5:
-            self.weights['wait'] = max(self.min_weights['wait'], self.weights['wait'] - 0.005)
-        
+            self.weights["wait"] = max(
+                self.min_weights["wait"], self.weights["wait"] - 0.005
+            )
+
         # 规则 2：KV 压力大 → 提升 kv_benefit
         if kv_util > 0.80:
-            self.weights['kv_benefit'] = min(self.max_weights['kv_benefit'], self.weights['kv_benefit'] + 0.008)
-            self.weights['frag_penalty'] = min(self.max_weights['frag_penalty'], self.weights['frag_penalty'] + 0.005)
+            self.weights["kv_benefit"] = min(
+                self.max_weights["kv_benefit"],
+                self.weights["kv_benefit"] + 0.008,
+            )
+            self.weights["frag_penalty"] = min(
+                self.max_weights["frag_penalty"],
+                self.weights["frag_penalty"] + 0.005,
+            )
         else:
-            self.weights['frag_penalty'] = max(self.min_weights['frag_penalty'], self.weights['frag_penalty'] - 0.002)
-        
+            self.weights["frag_penalty"] = max(
+                self.min_weights["frag_penalty"],
+                self.weights["frag_penalty"] - 0.002,
+            )
+
         # 规则 3：Decode 占比高 → 提升 decode_stability
         if running_count > 0:
-            decode_ratio = sum(1 for req in self.running if req.num_computed_tokens >= req.num_prompt_tokens) / running_count
+            decode_ratio = (
+                sum(
+                    1
+                    for req in self.running
+                    if req.num_computed_tokens >= req.num_prompt_tokens
+                )
+                / running_count
+            )
             if decode_ratio > 0.7:
-                self.weights['decode_stability'] = min(self.max_weights['decode_stability'], self.weights['decode_stability'] + 0.005)
+                self.weights["decode_stability"] = min(
+                    self.max_weights["decode_stability"],
+                    self.weights["decode_stability"] + 0.005,
+                )
             elif decode_ratio < 0.3:
-                self.weights['decode_stability'] = max(self.min_weights['decode_stability'], self.weights['decode_stability'] - 0.003)
-        
+                self.weights["decode_stability"] = max(
+                    self.min_weights["decode_stability"],
+                    self.weights["decode_stability"] - 0.003,
+                )
+
         # 归一化
         total = sum(self.weights.values())
         if total > 0:
@@ -550,6 +521,15 @@ class Scheduler(SchedulerInterface):
                 self.weights[k] /= total
         
         self.utility_weights = self.weights
+
+    def _get_request_utility(
+        self, request: Request, now: float, cache_info: dict
+    ) -> float:
+        """Return the request utility using the current controller weights."""
+        utility = request.utility_score(self.weights, now, cache_info)
+        if not math.isfinite(utility):
+            return 0.0
+        return utility
 
 
 
@@ -825,108 +805,40 @@ class Scheduler(SchedulerInterface):
 
 
             if self.policy == SchedulingPolicy.UTILITY and use_utility:
-                # ============================================================
-                # 1. 状态快照
-                # ============================================================
-                now = time.monotonic()
-                total_blocks = self.total_blocks
-                available_blocks = self.kv_cache_manager.block_pool.get_num_free_blocks()
-                kv_util = 1.0 - (available_blocks / total_blocks) if total_blocks > 0 else 0.0
-                running_req_ids = {req.request_id for req in self.running}
-            
-                # ============================================================
-                # 2. 收集候选请求
-                # ============================================================
-                MAX_CANDIDATES = 64
+                now = time.time()
                 all_waiting = list(self.waiting) + list(self.skipped_waiting)
-                if len(all_waiting) > MAX_CANDIDATES:
-                    all_waiting.sort(key=lambda r: r.arrival_time)
-                    all_waiting = all_waiting[:MAX_CANDIDATES]
-            
                 candidates = []
-                step_skipped_waiting = create_request_queue(self.policy)
-            
+
                 for req in all_waiting:
-                    # 阻塞状态检查
-                    if self._is_blocked_waiting_status(req.status):
-                        if not self._try_promote_blocked_waiting_request(req):
-                            continue
-            
-                    # LoRA 约束
-                    if (self.lora_config and req.lora_request and
-                        len(scheduled_loras) == self.lora_config.max_loras and
-                        req.lora_request.lora_int_id not in scheduled_loras):
+                    if self._is_blocked_waiting_status(
+                        req.status
+                    ) and not self._try_promote_blocked_waiting_request(req):
                         continue
-            
-                    # 计算资源需求
-                    need_tokens = req.num_tokens - req.num_computed_tokens
-                    if need_tokens <= 0:
+
+                    if (
+                        self.lora_config
+                        and req.lora_request
+                        and len(scheduled_loras) == self.lora_config.max_loras
+                        and req.lora_request.lora_int_id not in scheduled_loras
+                    ):
                         continue
-            
+
+                    if req.num_tokens <= req.num_computed_tokens:
+                        continue
+
                     cache_info = self.kv_cache_manager.get_request_cache_info(req)
-                    computed_blocks = cache_info.get('computed_blocks', 0)
-                    total_blocks_needed = cache_info.get('total_blocks_needed', 0)
-                    need_blocks = total_blocks_needed - computed_blocks
-                    if need_blocks < 1:
-                        need_blocks = (need_tokens + self.block_size - 1) // self.block_size
-            
-                    encoder_cost = sum(1 for _ in req.mm_features) if req.has_encoder_inputs else 0
-            
-                    # --- 可行性过滤（资源不足则跳过本轮） ---
-                    if need_tokens > token_budget or need_blocks > available_blocks or encoder_cost > encoder_compute_budget:
-                        step_skipped_waiting.prepend_request(req)
-                        continue
-            
-                    # ============================================================
-                    # 3. 计算 Utility（核心四维度）
-                    # ============================================================
-                    # 3.1 等待时间（自然 aging）
-                    wait_ms = (now - req.arrival_time) * 1000
-                    wait_score = min(wait_ms / 1000.0, 1.0)
-            
-                    # 3.2 优先级
-                    priority_score = 1.0 - (req.priority / 9.0)
-            
-                    # 3.3 Prefix Cache 命中收益
-                    hit_rate = cache_info.get('hit_rate', 0.0)
-                    prefix_hit_score = hit_rate * 1  # 最大 0.5
-            
-                    # 3.4 资源成本（长请求惩罚）
-                    block_cost = min(need_blocks / 100.0, 0.5)
-            
-                    # 3.5 Decode 阶段奖励（保持连续性）
-                    decode_bonus = 0.5 if req.num_computed_tokens >= req.num_prompt_tokens else 0.0
-            
-                    # 3.6 综合 utility
-                    utility = (
-                        0.20 * wait_score +
-                        0.20 * priority_score +
-                        0.50 * prefix_hit_score -
-                        0.40 * block_cost +
-                        0.30 * decode_bonus
-                    )
-            
-                    # 防止 NaN 或负值
-                    if utility is None or math.isnan(utility) or utility < 0.01:
-                        utility = 0.01
-            
-                    candidates.append((req, utility, need_tokens, max(need_blocks, 1), cache_info, encoder_cost))
-            
-                # ============================================================
-                # 4. 按 utility 降序排序（一次性排序，无分组）
-                # ============================================================
+                    utility = self._get_request_utility(req, now, cache_info)
+                    candidates.append((req, utility))
+
                 candidates.sort(key=lambda x: x[1], reverse=True)
-            
-                # ============================================================
-                # 5. 顺序调度（资源够就调度，不够就放入 skipped）
-                # ============================================================
-                for req, utility, need_tokens, need_blocks, cache_info, encoder_cost in candidates:
-                    if need_tokens > token_budget or need_blocks > available_blocks or encoder_cost > encoder_compute_budget:
-                        # 资源不足，放入 step_skipped_waiting 等待下一轮
-                        step_skipped_waiting.prepend_request(req)
-                        continue
-            
-                    success, consumed_tokens, consumed_blocks, new_encoder_budget = (
+
+                for req, _ in candidates:
+                    if (
+                        token_budget <= 0
+                        or len(self.running) >= self.max_num_running_reqs
+                    ):
+                        break
+                    success, consumed_tokens, _, new_encoder_budget = (
                         self._try_schedule_request(
                             req,
                             scheduled_loras,
@@ -946,28 +858,24 @@ class Scheduler(SchedulerInterface):
             
                     if success:
                         token_budget -= consumed_tokens
-                        available_blocks -= consumed_blocks
                         encoder_compute_budget = new_encoder_budget
                     else:
-                        # 分配失败（如 KV 分配失败），放回队列
-                        step_skipped_waiting.prepend_request(req)
-            
-                # ============================================================
-                # 6. 收尾：未调度的请求放回 skipped_waiting
-                # ============================================================
-                if step_skipped_waiting:
-                    self.skipped_waiting.prepend_requests(step_skipped_waiting)
-            
+                        # Async KV loading removes the request from its original
+                        # queue before returning. Keep it tracked exactly once.
+                        if req not in self.waiting and req not in self.skipped_waiting:
+                            self.skipped_waiting.add_request(req)
+
                 if not defer_prefills:
                     self.prefill_capacity_bound = bool(self.waiting)
-            
-                # ============================================================
-                # 7. 反馈控制（权重更新）
-                # ============================================================
-                self.weights_update_counter += 1
-                if self.weights_update_counter >= self.WEIGHTS_UPDATE_INTERVAL:
-                    self.weights_update_counter = 0
-                    self._update_weights()
+
+                if self.enable_feedback_control:
+                    self.weights_update_counter += 1
+                    if (
+                        self.weights_update_counter
+                        >= self.WEIGHTS_UPDATE_INTERVAL
+                    ):
+                        self.weights_update_counter = 0
+                        self._update_weights()
                 
             else:     
                 step_skipped_waiting = create_request_queue(self.policy)
@@ -1464,11 +1372,6 @@ class Scheduler(SchedulerInterface):
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
 
-
-        # 每 100 步打印一次摘要
-        if self.current_step % 100 == 0:
-            avg_total = self.stats['schedule_total_ms'] / max(1, self.stats['schedule_calls'])
-            logger.info(f"[SCHED_PERF] avg_total={avg_total:.3f}ms, queue_len={_queue_len}")
 
 
 
@@ -2825,7 +2728,12 @@ class Scheduler(SchedulerInterface):
         # KV Connector:: update recv and send status from last step.
         for req_id in kv_connector_output.finished_recving or ():
             logger.debug("Finished recving KV transfer for request %s", req_id)
-            assert req_id in self.requests
+            if req_id not in self.requests:
+                logger.warning(
+                    "Ignoring late KV receive completion for request %s",
+                    req_id,
+                )
+                continue
             req = self.requests[req_id]
             if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                 self.finished_recving_kv_req_ids.add(req_id)
@@ -2834,7 +2742,12 @@ class Scheduler(SchedulerInterface):
                 self._free_blocks(self.requests[req_id])
         for req_id in kv_connector_output.finished_sending or ():
             logger.debug("Finished sending KV transfer for request %s", req_id)
-            assert req_id in self.requests
+            if req_id not in self.requests:
+                logger.warning(
+                    "Ignoring late KV send completion for request %s",
+                    req_id,
+                )
+                continue
             self._free_blocks(self.requests[req_id])
 
     def _update_requests_with_invalid_blocks(
@@ -3329,7 +3242,3 @@ class Scheduler(SchedulerInterface):
             'queue_len_samples': [],
         }
         return stats
-
-
-
-

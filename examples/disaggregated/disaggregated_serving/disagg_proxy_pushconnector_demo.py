@@ -30,6 +30,7 @@ disagg_proxy_pushconnector_demo.py \
 """
 
 import argparse
+import asyncio
 import contextlib
 import ipaddress
 import itertools
@@ -152,7 +153,7 @@ class PushProxy:
                 async with session.post(
                     url=url, json=data, headers=headers
                 ) as response:
-                    if 200 <= response.status < 300 or 400 <= response.status < 500:
+                    if 200 <= response.status < 300:
                         if use_chunked:
                             async for chunk_bytes in response.content.iter_chunked(
                                 1024
@@ -165,7 +166,8 @@ class PushProxy:
                         with contextlib.suppress(json.JSONDecodeError):
                             error_content = json.loads(error_content)
                         logger.error(
-                            "Request failed with status %s: %s",
+                            "Upstream request to %s failed with status %s: %s",
+                            url,
                             response.status,
                             error_content,
                         )
@@ -255,17 +257,35 @@ class PushProxy:
         decode_instance = self.schedule(self.decode_cycler)
         headers = self._common_headers(request_id)
 
-        # Fire prefill; we don't read its body but must drain the
-        # connection so the upstream server can free its slot.
-        async for _ in self.forward_request(
-            f"http://{prefill_instance}{path}", prefill_request, headers
-        ):
-            continue
+        async def drain_prefill():
+            # The body must be drained so the upstream server can release its
+            # request slot and HTTP connection.
+            async for _ in self.forward_request(
+                f"http://{prefill_instance}{path}",
+                prefill_request,
+                headers,
+            ):
+                continue
 
-        generator = self.forward_request(
-            f"http://{decode_instance}{path}", decode_request, headers
-        )
-        return StreamingResponse(generator)
+        async def stream_decode():
+            # Start P and D together. D can allocate/register its blocks while
+            # P computes, allowing P to push each layer as soon as it is ready.
+            prefill_task = asyncio.create_task(drain_prefill())
+            try:
+                async for chunk in self.forward_request(
+                    f"http://{decode_instance}{path}",
+                    decode_request,
+                    headers,
+                ):
+                    yield chunk
+                await prefill_task
+            finally:
+                if not prefill_task.done():
+                    prefill_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await prefill_task
+
+        return StreamingResponse(stream_decode())
 
     async def create_completion(self, raw_request: Request):
         try:

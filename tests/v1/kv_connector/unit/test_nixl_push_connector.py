@@ -29,7 +29,11 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import msgspec
+import numpy as np
 
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
+    NixlBaseConnectorWorker,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     PUSH_REG_NOTIF_PREFIX,
     NixlConnectorMetadata,
@@ -113,6 +117,36 @@ def _stub_sw_clipping(scheduler) -> None:
 
 
 class TestPushScheduler:
+    def test_layerwise_mode_builds_save_metadata_before_forward(self):
+        sched = make_nixl_push_scheduler(enable_layerwise_transfer=True)
+        _stub_sw_clipping(sched)
+        request = _make_request(request_id="req-layer", is_d_side=False)
+        blocks = _BlocksMock(block_ids=([3, 4],))
+
+        sched.update_state_after_alloc(request, blocks, num_external_tokens=0)
+
+        scheduler_output = MagicMock()
+        with patch.object(
+            sched.__class__.__mro__[1],
+            "build_connector_meta",
+            return_value=NixlConnectorMetadata(),
+        ):
+            meta = sched.build_connector_meta(scheduler_output)
+
+        assert meta.reqs_to_save["req-layer"].local_block_ids == ([3, 4],)
+        assert sched._layerwise_save_meta == {}
+
+    def test_layerwise_mode_avoids_duplicate_whole_request_push(self):
+        sched = make_nixl_push_scheduler(enable_layerwise_transfer=True)
+        _stub_sw_clipping(sched)
+        request = _make_request(request_id="req-layer", is_d_side=False)
+
+        delay, _ = sched.request_finished(request, ([5, 6],))
+
+        assert delay
+        assert "req-layer" in sched._finished_request_blocks
+        assert "req-layer" not in sched._newly_finished_push_blocks
+
     def test_d_side_update_state_after_alloc_stages_registration(self):
         """D scheduler stashes registration data + arms watchdog deadline."""
         sched = make_nixl_push_scheduler()
@@ -296,6 +330,19 @@ class TestPushScheduler:
 # ----------------------------------------------------------------- #
 
 
+def test_compute_layer_desc_ids_limits_transfer_to_selected_regions():
+    worker = object.__new__(NixlBaseConnectorWorker)
+    worker._has_mamba = False
+
+    desc_ids = worker._compute_layer_desc_ids(
+        block_ids=([1, 3],),
+        dst_num_blocks=8,
+        region_ids=(2, 3),
+    )
+
+    np.testing.assert_array_equal(desc_ids, np.asarray([17, 19, 25, 27]))
+
+
 class _StubWriterWorker(NixlPushConnectorWorker):
     """Construct a worker without invoking ``__init__`` so we can drive
     the matching/notif logic without bringing up NIXL or torch."""
@@ -316,6 +363,12 @@ class _StubWriterWorker(NixlPushConnectorWorker):
         w._pending_d_registrations = {}
         w._reg_send_inbox = queue.Queue()
         w._finished_blocks_inbox = queue.Queue()
+        w._layer_ready_inbox = queue.Queue()
+        w._pending_layer_chunks = defaultdict(dict)
+        w._failed_layerwise_requests = set()
+        w._layerwise_completion_targets = {}
+        w._layerwise_submitted_layers = defaultdict(set)
+        w._layerwise_fully_submitted_requests = set()
         w._pending_completion_notifs = queue.Queue()
         w._evict_finished_inbox = queue.Queue()
         w._push_writer_wake = threading.Event()
@@ -590,6 +643,8 @@ class TestPushSchedulerNegative:
 
         assert sched._push_pending_registrations == {}
         assert sched._push_registration_deadlines == {}
+        assert request.kv_transfer_params["remote_block_ids"] == ()
+        assert request.kv_transfer_params["do_remote_prefill"] is False
 
     def test_request_finished_unfinished_status_does_not_stage(self):
         """If a request is still RUNNING, request_finished must not stash
@@ -607,6 +662,33 @@ class TestPushSchedulerNegative:
         assert ret is None
         assert sched._finished_request_blocks == {}
         assert sched._newly_finished_push_blocks == {}
+
+    def test_aborted_d_request_builds_empty_receive_metadata(self):
+        """An unscheduled D request must still have complete push metadata."""
+        sched = make_nixl_push_scheduler()
+        request = _make_request(request_id="req-aborted-d")
+
+        delay, result = sched.request_finished(request, ((),))
+
+        assert delay is False
+        assert result is None
+        assert request.kv_transfer_params["remote_block_ids"] == ()
+        meta = sched.build_connector_meta(MagicMock())
+        assert meta.reqs_to_recv[request.request_id].remote is not None
+        assert meta.reqs_to_recv[request.request_id].remote.block_ids == ()
+
+    def test_build_meta_normalizes_legacy_push_receive_params(self):
+        """The Push metadata boundary tolerates a missing remote block list."""
+        sched = make_nixl_push_scheduler()
+        request = _make_request(request_id="req-legacy-d")
+        request.kv_transfer_params["do_remote_prefill"] = False
+        sched._reqs_need_recv[request.request_id] = (request, [])
+
+        meta = sched.build_connector_meta(MagicMock())
+
+        assert request.kv_transfer_params["remote_block_ids"] == ()
+        assert meta.reqs_to_recv[request.request_id].remote is not None
+        assert meta.reqs_to_recv[request.request_id].remote.block_ids == ()
 
     def test_request_finished_empty_blocks_does_not_arm_lease(self):
         """Empty block-id groups should still complete cleanly without
@@ -751,6 +833,62 @@ class TestPushWriterNegative:
         assert w._evict_finished_inbox.qsize() == 0
         # Wake set so the writer drains NIXL notifs even when idle.
         assert w._push_writer_wake.is_set()
+
+    def test_get_finished_waits_until_every_layer_was_submitted(self):
+        """A gap between layers must not look like request completion."""
+        w = _StubWriterWorker.fresh()
+        w.layer_name_to_region_ids = {
+            "model.layers.0.self_attn.attn": (0, 1),
+            "model.layers.1.self_attn.attn": (2, 3),
+        }
+        request_id = "req-layerwise"
+        w._layerwise_completion_targets[request_id] = (
+            "decode-engine",
+            "decode-request",
+        )
+        w._layerwise_submitted_layers[request_id].add(
+            "model.layers.0.self_attn.attn"
+        )
+
+        with (
+            patch.object(
+                NixlPushConnectorWorker.__mro__[1],
+                "get_finished",
+                return_value=(set(), set()),
+            ),
+            patch.object(
+                w,
+                "_pop_done_transfers",
+                return_value={request_id},
+            ),
+        ):
+            done_sending, done_recving = w.get_finished()
+
+        assert done_sending == set()
+        assert done_recving == set()
+        assert request_id in w._layerwise_completion_targets
+        assert w._evict_finished_inbox.empty()
+
+    def test_get_finished_completes_fully_submitted_request_without_handles(self):
+        """Layers with no descriptors form a valid completed no-op request."""
+        w = _StubWriterWorker.fresh()
+        request_id = "req-empty-layers"
+        w.layer_name_to_region_ids = {"model.layers.0.attn": (0, 1)}
+        w._layerwise_submitted_layers[request_id].add(
+            "model.layers.0.attn"
+        )
+        w._layerwise_fully_submitted_requests.add(request_id)
+
+        with patch.object(
+            NixlPushConnectorWorker.__mro__[1],
+            "get_finished",
+            return_value=(set(), set()),
+        ):
+            done_sending, done_recving = w.get_finished()
+
+        assert done_sending == {request_id}
+        assert done_recving == set()
+        assert request_id not in w._layerwise_fully_submitted_requests
 
     def test_get_new_notifs_unknown_request_is_logged_and_skipped(self, caplog):
         """A completion notif for a request the worker doesn't know

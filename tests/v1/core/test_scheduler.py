@@ -53,6 +53,25 @@ def test_add_requests():
         assert len(scheduler.waiting) == i + 1
 
 
+def test_utility_scheduler_uses_aging_and_preserves_requests():
+    scheduler = create_scheduler(
+        max_num_seqs=1,
+        max_num_batched_tokens=16,
+        scheduling_policy="utility",
+    )
+    old_req, new_req = create_requests(
+        num_requests=2, num_tokens=8, req_ids=["old", "new"]
+    )
+    old_req.arrival_time -= 20.0
+    scheduler.add_request(new_req)
+    scheduler.add_request(old_req)
+
+    output = scheduler.schedule()
+
+    assert [req.req_id for req in output.scheduled_new_reqs] == ["old"]
+    assert list(scheduler.waiting) == [new_req]
+
+
 def test_finish_request():
     scheduler = create_scheduler()
     requests = create_requests(num_requests=10)

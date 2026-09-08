@@ -1,0 +1,51 @@
+{
+  "arguments": {
+    "base_url": "http://127.0.0.1:8000",
+    "model": "/home/hx/Qwen3-8B-Instruct",
+    "tokenizer": null,
+    "label": "layerwise",
+    "output_dir": "benchmark_results/push_layerwise_1",
+    "input_tokens": [
+      512,
+      1024,
+      2048,
+      4096
+    ],
+    "concurrency": [
+      2,
+      4,
+      8,
+      16
+    ],
+    "output_tokens": 128,
+    "max_model_len": 12288,
+    "requests": 10,
+    "warmup_requests": 3,
+    "timeout": 1800,
+    "prefill_metrics_url": "http://127.0.0.1:8100/metrics",
+    "metrics_settle_seconds": 1.0,
+    "seed": 20260728
+  },
+  "proxy_status": {
+    "mode": "push",
+    "prefill_node_count": 1,
+    "decode_node_count": 1,
+    "prefill_nodes": [
+      "localhost:8100"
+    ],
+    "decode_nodes": [
+      "localhost:8200"
+    ],
+    "prefill_engine_id": "p-engine-001",
+    "prefill_kv_host": "127.0.0.1",
+    "prefill_side_channel_port": 5600,
+    "prefill_tp_size": 1
+  },
+  "timestamp": "2026-07-28T23:26:29+0800",
+  "metric_notes": {
+    "ttft_ms": "client POST start to first non-empty SSE token",
+    "tpot_ms": "(E2E - TTFT) / (tokenizer output tokens - 1)",
+    "mean_itl_ms": "mean gap between non-empty SSE text events",
+    "throughput": "successful output tokens / scenario wall time"
+  }
+}

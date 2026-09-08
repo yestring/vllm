@@ -208,8 +208,10 @@ class KVCacheManager:
 
 
     def get_request_cache_info(self, request: Request) -> dict:
-        _, num_computed_tokens = self.get_computed_blocks(request)
-        
+        _, num_computed_tokens = self.get_computed_blocks(
+            request, record_stats=False
+        )
+
         total_blocks = self.kv_cache_config.num_blocks
         block_size = self.scheduler_block_size
         free_blocks = self.block_pool.get_num_free_blocks()
@@ -217,11 +219,19 @@ class KVCacheManager:
         
         # 使用 token 级别的复用率
         total_prompt_tokens = request.num_prompt_tokens
-        hit_rate = num_computed_tokens / total_prompt_tokens if total_prompt_tokens > 0 else 0.0
-        
+        hit_rate = (
+            num_computed_tokens / total_prompt_tokens
+            if total_prompt_tokens > 0
+            else 0.0
+        )
+
         total_blocks_needed = (total_prompt_tokens + block_size - 1) // block_size
-        computed_blocks = (num_computed_tokens + block_size - 1) // block_size if num_computed_tokens > 0 else 0
-        
+        computed_blocks = (
+            (num_computed_tokens + block_size - 1) // block_size
+            if num_computed_tokens > 0
+            else 0
+        )
+
         return {
             'computed_blocks': computed_blocks,
             'num_computed_tokens': num_computed_tokens,
@@ -248,7 +258,9 @@ class KVCacheManager:
 
     
 
-    def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int]:
+    def get_computed_blocks(
+        self, request: Request, *, record_stats: bool = True
+    ) -> tuple[KVCacheBlocks, int]:
         """Get the computed (cached) blocks for the request.
         Note that the computed blocks must be full.
 
@@ -280,7 +292,7 @@ class KVCacheManager:
             )
         )
 
-        if self.log_stats:
+        if self.log_stats and record_stats:
             assert self.prefix_cache_stats is not None
             self.prefix_cache_stats.record(
                 num_tokens=request.num_tokens,

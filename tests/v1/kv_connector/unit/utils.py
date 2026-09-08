@@ -532,6 +532,7 @@ def make_nixl_push_scheduler(
     push_registration_timeout: float | None = None,
     is_bidirectional_kv_xfer_enabled: bool = False,
     has_mamba: bool = False,
+    enable_layerwise_transfer: bool = False,
 ):
     """Create a NixlPushConnectorScheduler via __new__ (skipping __init__).
 
@@ -573,6 +574,8 @@ def make_nixl_push_scheduler(
     sched._push_registration_deadlines = {}
     sched._finished_request_blocks = {}
     sched._newly_finished_push_blocks = {}
+    sched._layerwise_save_meta = {}
+    sched.enable_layerwise_transfer = enable_layerwise_transfer
     sched._push_registration_timeout = (
         push_registration_timeout
         if push_registration_timeout is not None

@@ -156,6 +156,29 @@ class NixlBaseConnectorWorker:
 
         return np.concatenate(all_descs)
 
+    def _compute_layer_desc_ids(
+        self,
+        block_ids: BlockIds,
+        dst_num_blocks: int,
+        region_ids: tuple[int, ...],
+    ) -> np.ndarray:
+        """Compute descriptor IDs for one attention layer.
+
+        Layerwise push currently supports uniform full-attention/MLA caches
+        where logical block IDs address the same regions on P and D.
+        Hybrid attention/SSM layouts require group-specific region mappings
+        and are rejected by the caller.
+        """
+        if self._has_mamba:
+            raise NotImplementedError(
+                "Layerwise NIXL push does not support hybrid SSM caches"
+            )
+        if not region_ids:
+            raise ValueError("No registered NIXL regions for KV layer")
+        block_arr = np.concatenate(block_ids)[None, :]
+        regions = np.asarray(region_ids, dtype=np.int64)[:, None]
+        return (regions * dst_num_blocks + block_arr).flatten()
+
     def _build_local_splits_from_plan(
         self,
         plan: TPMapping,
@@ -410,6 +433,7 @@ class NixlBaseConnectorWorker:
         # Number of NIXL regions. Currently one region per cache
         # (so 1 per layer for MLA, otherwise 2 per layer)
         self.num_regions = 0
+        self.layer_name_to_region_ids: dict[str, tuple[int, ...]] = {}
 
         # nixl_prepped_dlist_handle.
         self.src_xfer_handles_by_block_size: dict[int, int] = {}
@@ -990,6 +1014,7 @@ class NixlBaseConnectorWorker:
         caches_data = []
         # With hybrid allocator, layers can share a kv cache tensor
         seen_base_addresses = []
+        virtual_region_cursor = 0
 
         # Note(tms): I modified this from the original region setup code.
         # K and V are now in different regions. Advantage is that we can
@@ -1002,6 +1027,7 @@ class NixlBaseConnectorWorker:
         tensor_size_bytes = None
 
         for layer_name, cache_or_caches in xfer_buffers.items():
+            layer_region_ids: list[int] = []
             # NOTE (NickLucche) Hybrid SSM models assume a layout that is similar to
             # that of FI, with block laid out as in `get_backend_aware_kv_block_len`.
             # However, physical page_size may differ when kernel requires a specific
@@ -1059,7 +1085,25 @@ class NixlBaseConnectorWorker:
                 logger.debug(
                     "Registering layer %s with cache shape: %s", layer_name, cache.shape
                 )
+                is_mla_region = isinstance(
+                    layer_spec, (MLAAttentionSpec, SlidingWindowMLASpec)
+                )
                 seen_base_addresses.append(base_addr)
+                num_virtual_regions = (
+                    1
+                    if (
+                        not self.transfer_topo.virtually_split_kv_in_blocks
+                        or is_mla_region
+                    )
+                    else 2
+                )
+                layer_region_ids.extend(
+                    range(
+                        virtual_region_cursor,
+                        virtual_region_cursor + num_virtual_regions,
+                    )
+                )
+                virtual_region_cursor += num_virtual_regions
                 # Only record non-Mamba page sizes.
                 if isinstance(layer_spec, MambaSpec):
                     self.block_len_per_layer.append(
@@ -1067,9 +1111,6 @@ class NixlBaseConnectorWorker:
                     )
                 else:
                     self.block_len_per_layer.append(physical_page_size)
-                is_mla_region = isinstance(
-                    layer_spec, (MLAAttentionSpec, SlidingWindowMLASpec)
-                )
                 self._region_is_mla.append(is_mla_region)
 
                 if not is_mla_region:
@@ -1100,6 +1141,10 @@ class NixlBaseConnectorWorker:
                 self.device_id = max(cache.get_device(), 0)
                 caches_data.append(
                     (base_addr, curr_tensor_size_bytes, self.device_id, "")
+                )
+            if layer_region_ids:
+                self.layer_name_to_region_ids[layer_name] = tuple(
+                    layer_region_ids
                 )
 
         logger.debug(

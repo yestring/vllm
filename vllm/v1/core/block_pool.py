@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import math
+import time
 from collections.abc import Iterable, Sequence
 from typing import Any
-import math, time
+
 from vllm.distributed.kv_events import (
     MEDIUM_GPU,
     AllBlocksCleared,
@@ -10,9 +12,9 @@ from vllm.distributed.kv_events import (
     BlockStored,
     KVCacheEvent,
 )
-from vllm.v1.core.kv_cache_policy import LossAwareEvictionPolicy, BaseEvictionPolicy
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+from vllm.v1.core.kv_cache_policy import LossAwareEvictionPolicy
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     BlockHashList,
@@ -578,18 +580,27 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
-        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        if self.eviction_policy is None:
+            ret = self.free_block_queue.popleft_n(num_blocks)
+        else:
+            candidates = self.free_block_queue.get_all_free_blocks()
+            ret = self.eviction_policy.select_victims(candidates, num_blocks)
+            assert len(ret) == num_blocks
+            for block in ret:
+                self.free_block_queue.remove(block)
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
             for block in ret:
                 self._maybe_evict_cached_block(block)
+                block.reset_eviction_metadata()
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
         else:
             for block in ret:
+                block.reset_eviction_metadata()
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
                 if self.metrics_collector:
@@ -623,11 +634,15 @@ class BlockPool:
         for block in blocks:
             # ===== 更新统计信息（供 Policy 使用） =====
             if self.enable_loss_eviction:
-                # EMA 热度更新
-                block.ema_hotness = block.ema_hotness * 0.9 + 0.1
-                block.last_access_time = time.time()
-                block.prefix_share_count += 1
-            # ======================================
+                now = time.time()
+                if block.last_access_time > 0:
+                    elapsed = max(now - block.last_access_time, 0.0)
+                    decay = math.exp(
+                        -elapsed / self.eviction_policy.half_life
+                    )
+                    block.access_frequency *= decay
+                block.access_frequency += 1.0
+                block.last_access_time = now
             
             if block.ref_cnt == 0 and not block.is_null:
                 self.free_block_queue.remove(block)
@@ -650,16 +665,14 @@ class BlockPool:
                 else:
                     blocks_with_hash.append(block)
     
-        # ===== Loss-aware 分支：调用 Policy =====
-        if self.enable_loss_eviction and self.eviction_policy is not None:
-            candidate_blocks = blocks_without_hash + blocks_with_hash
-            # 策略选择 victim（这里全部候选块都视为可驱逐）
-            sorted_blocks = self.eviction_policy.select_victims(candidate_blocks, len(candidate_blocks))
-            self.free_block_queue.prepend_n(sorted_blocks)
+        if self.enable_loss_eviction:
+            # Victims are selected globally in get_new_blocks. Preserve cheap
+            # O(1) insertion here and avoid pretending this batch-local order
+            # is a global eviction order.
+            self.free_block_queue.append_n(blocks_without_hash)
+            self.free_block_queue.append_n(blocks_with_hash)
             return
-        # ========================================
-    
-        # ===== 以下保持原始 LRU 逻辑 =====
+
         self.free_block_queue.prepend_n(blocks_without_hash)
         self.free_block_queue.append_n(blocks_with_hash)
 
@@ -750,7 +763,3 @@ class BlockPool:
         events = self.kv_event_queue
         self.kv_event_queue = []
         return events
-
-
-
-    

@@ -86,6 +86,9 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         self._finished_request_blocks: dict[ReqId, BlockIds] = {}
         # P-side: newly finished blocks to ship to P workers on next step.
         self._newly_finished_push_blocks: dict[ReqId, BlockIds] = {}
+        self._layerwise_save_meta: dict[
+            ReqId, tuple[BlockIds, dict[str, Any]]
+        ] = {}
 
         # Soft watchdog timeout (seconds) for D-side registrations that
         # never receive a push completion. Defaults to the existing
@@ -97,6 +100,15 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
                 self.decoder_kv_blocks_ttl,
             )
         )
+        self.enable_layerwise_transfer = bool(
+            vllm_config.kv_transfer_config.get_from_extra_config(
+                "enable_layerwise_transfer", False
+            )
+        )
+        if self.enable_layerwise_transfer and self.use_host_buffer:
+            raise NotImplementedError(
+                "Layerwise NIXL push does not support host KV buffers"
+            )
 
     def get_num_new_matched_tokens(
         self, request: Request, num_computed_tokens: int
@@ -140,22 +152,19 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
             params,
         )
 
-        print(f"我在push_scheduler.py里的update_state_after_alloc")
-        print(f"params:{params}")
         if not params:
             return
 
         # P side: track the request as in-batch so the lease accounting
         # matches what the worker expects on the next step.
-        # P side: track the request as in-batch
         if params.get("do_remote_decode"):
             self._reqs_in_batch.add(request.request_id)
-            # P side with host-buffer offload
-            if self.use_host_buffer:
-                self._reqs_need_save[request.request_id] = request
-                return
-            # P 端在这里返回，不进入注册生成逻辑
-            return
+            if self.enable_layerwise_transfer and not self.use_host_buffer:
+                local_block_ids = blocks.get_unhashed_block_ids_all_groups()
+                self._layerwise_save_meta[request.request_id] = (
+                    self.get_sw_clipped_blocks(local_block_ids),
+                    params,
+                )
 
         # P side with host-buffer offload: defer save to the worker.
         if self.use_host_buffer and params.get("do_remote_decode"):
@@ -167,10 +176,14 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         if not params.get("do_remote_prefill"):
             return
 
-        # if num_external_tokens <= 0:
-        #     # Nothing to receive: full prefix-cache hit on D, no
-        #     # registration to stage.
-        #     return
+        if num_external_tokens <= 0:
+            # Nothing to receive: full prefix-cache hit on D, no
+            # registration to stage. Keep the transfer parameters complete
+            # because the base metadata path may still materialize a ReqMeta
+            # for this request.
+            params["remote_block_ids"] = ()
+            params["do_remote_prefill"] = False
+            return
 
         # First-pass D path: stash registration data the worker will
         # ship to P on the next ``build_connector_meta`` cycle.
@@ -213,10 +226,6 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         # doesn't re-stage the registration.
         params["do_remote_prefill"] = False
 
-        logger.info(f"[PUSH_REG] Stored registration for req {request.request_id}, "
-            f"local_block_ids={local_block_ids}, "
-            f"remote_engine_id={params['remote_engine_id']}")
-
     def request_finished(
         self,
         request: Request,
@@ -252,6 +261,7 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
             # stranding the prefill blocks, we still register an empty
             # recv so the worker emits a notif that lets P free them.
             self._reqs_need_recv[request.request_id] = (request, [])
+            params["remote_block_ids"] = ()
             params["do_remote_prefill"] = False
             return False, None
 
@@ -287,7 +297,8 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
             # Store finished blocks for worker-level matching with D
             # registrations (via NIXL notifications).
             self._finished_request_blocks[request.request_id] = block_ids
-            self._newly_finished_push_blocks[request.request_id] = block_ids
+            if not self.enable_layerwise_transfer:
+                self._newly_finished_push_blocks[request.request_id] = block_ids
 
         return delay_free_blocks, dict(
             do_remote_prefill=True,
@@ -305,8 +316,22 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         self,
         scheduler_output: SchedulerOutput,
     ) -> KVConnectorMetadata:
+        # Push D never learns P's block IDs from the HTTP request. Normal and
+        # zero-token allocation paths seed this field themselves, but aborted
+        # or rejected requests can enter ``_reqs_need_recv`` without passing
+        # either path. Normalize every pending Push receive at the protocol
+        # boundary before the shared NIXL metadata builder reads it.
+        for req, _ in self._reqs_need_recv.values():
+            assert req.kv_transfer_params is not None
+            req.kv_transfer_params.setdefault("remote_block_ids", ())
+
         meta = super().build_connector_meta(scheduler_output)
         assert isinstance(meta, NixlConnectorMetadata)
+
+        if self.enable_layerwise_transfer:
+            for req_id, (block_ids, params) in self._layerwise_save_meta.items():
+                meta.add_new_req_to_save(req_id, block_ids, params)
+            self._layerwise_save_meta.clear()
 
         # Watchdog: any D-side registration whose deadline has passed without
         # a corresponding push completion is treated as failed and cleaned up.
@@ -363,21 +388,3 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         # watchdog so we don't trip an expiration on a fulfilled request.
         for req_id in connector_output.finished_recving or ():
             self._push_registration_deadlines.pop(req_id, None)
-
-
-    # 在 NixlPushConnectorScheduler 类中新增
-
-    def submit_layer_kv(self, req_id: str, layer_idx: int, block_ids: BlockIds):
-        """Scheduler 侧转发给 Worker 的流式传输接口"""
-        # 注意：Scheduler 和 Worker 在不同进程，需要通过某种方式传递。
-        # 最简单的方式：通过 EngineCore 的 request 对象传递，或者直接通过 Connector 的引用。
-        # 这里我们假设有办法拿到 worker 的引用。
-        if self.worker is not None:
-            self.worker.submit_layer_kv(req_id, layer_idx, block_ids)
-
-    
-    # 在 NixlPushConnectorScheduler 中
-    def flush_pending_kv(self, scheduler_output: SchedulerOutput):
-        """转发给 Worker"""
-        if self.worker is not None:
-            self.worker.flush_pending_kv(scheduler_output)

@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import math
 import enum
+import math
 import time
 from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any,  Optional
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -299,7 +299,7 @@ class Request:
         self,
         weights: dict,
         now: float,
-        cache_info: Optional[dict] = None,
+        cache_info: dict | None = None,
     ) -> float:
         """
         计算请求的效用值
@@ -313,11 +313,11 @@ class Request:
             cache_info = {}
         
         # 1. 等待时间
-        wait = now - self.arrival_time
-        wait_score = min(wait / 1.0, 1.0)
+        wait = max(now - self.arrival_time, 0.0)
+        wait_score = min(wait / 10.0, 1.0)
         
         # 2. 优先级
-        priority_score = 1.0 - (self.priority / 9.0)
+        priority_score = 1.0 / (1.0 + max(self.priority, 0))
         
         # 3. KV Cache 命中收益（默认 0）
         kv_benefit = 0.0
@@ -334,7 +334,9 @@ class Request:
         frag_penalty = 0.0
         if cache_info:
             kv_util = cache_info.get('kv_utilization', 0.0)
-            remaining_blocks = cache_info.get('total_blocks_needed', 0) - cache_info.get('computed_blocks', 0)
+            remaining_blocks = cache_info.get(
+                "total_blocks_needed", 0
+            ) - cache_info.get("computed_blocks", 0)
             if kv_util > 0.7 and remaining_blocks > 0:
                 frag_penalty = (remaining_blocks / 100.0) * (kv_util - 0.7) * 5.0
                 frag_penalty = min(frag_penalty, 1.0)
