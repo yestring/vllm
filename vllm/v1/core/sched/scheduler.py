@@ -45,6 +45,7 @@ from vllm.v1.core.sched.output import (
     NewRequestData,
     SchedulerOutput,
 )
+from vllm.v1.core.sched.prefill_attention_budget import PrefillAttentionBudget
 from vllm.v1.core.sched.request_queue import (
     RequestQueue,
     SchedulingPolicy,
@@ -52,7 +53,11 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    UniformTypeKVCacheSpecs,
+)
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
@@ -129,6 +134,47 @@ class Scheduler(SchedulerInterface):
         self.recompute_kv_load_failures = True
         self.defer_block_free = False
         kv_transfer_config = self.vllm_config.kv_transfer_config
+        self.prefill_attention_budget_limit = self.scheduler_config.prefill_attention_budget
+        if self.prefill_attention_budget_limit:
+            if (
+                kv_transfer_config is None
+                or kv_transfer_config.kv_role != "kv_producer"
+                or not self.scheduler_config.enable_chunked_prefill
+                or self.scheduler_config.is_multimodal_model
+                or self.is_encoder_decoder
+                or vllm_config.speculative_config is not None
+            ):
+                raise ValueError(
+                    "The prefill attention budget requires a dedicated text "
+                    "KV producer with chunked prefill and no speculative decoding."
+                )
+            for group in kv_cache_config.kv_cache_groups:
+                spec = group.kv_cache_spec
+                specs = (
+                    spec.kv_cache_specs.values()
+                    if isinstance(spec, UniformTypeKVCacheSpecs)
+                    else (spec,)
+                )
+                if not all(
+                    isinstance(layer, FullAttentionSpec)
+                    and layer.sliding_window is None
+                    and layer.attention_chunk_size is None
+                    and not layer.non_causal
+                    for layer in specs
+                ):
+                    raise ValueError(
+                        "The prefill attention budget requires full causal attention."
+                    )
+        reserve_window = self.scheduler_config.kv_admission_reserve_window_steps
+        self.track_kv_admission_growth = bool(reserve_window)
+        if self.track_kv_admission_growth and (
+            kv_transfer_config is None
+            or kv_transfer_config.kv_role != "kv_consumer"
+            or kv_transfer_config.kv_connector not in {"NixlConnector", "NixlPushConnector"}
+        ):
+            raise ValueError(
+                "Adaptive KV admission reserve requires a dedicated NIXL KV consumer."
+            )
         if kv_transfer_config is not None:
             assert not self.is_encoder_decoder, (
                 "Encoder-decoder models are not currently supported with KV connectors"
@@ -265,6 +311,8 @@ class Scheduler(SchedulerInterface):
             hash_block_size=hash_block_size,
             metrics_collector=self.kv_metrics_collector,
             watermark=self.scheduler_config.watermark,
+            admission_reserve_window_steps=reserve_window,
+            admission_reserve_quantile=self.scheduler_config.kv_admission_reserve_quantile,
         )
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
@@ -410,6 +458,19 @@ class Scheduler(SchedulerInterface):
             # Do not schedule any requests when paused.
             token_budget = 0
 
+        prefill_budget = (
+            PrefillAttentionBudget(self.prefill_attention_budget_limit)
+            if self.prefill_attention_budget_limit
+            else None
+        )
+        # Leave space for one lane of new requests while admitting in-progress
+        # chunks first. Keep the full budget available for a lone long request.
+        waiting_prefill_reserve = (
+            self.prefill_attention_budget_limit // 2
+            if prefill_budget is not None and self.waiting
+            else 0
+        )
+
         # Encoder-related.
         scheduled_encoder_inputs: dict[str, list[int]] = {}
         encoder_compute_budget = self.max_num_encoder_input_tokens
@@ -422,6 +483,11 @@ class Scheduler(SchedulerInterface):
         scheduled_timestamp = time.monotonic()
 
         self.kv_cache_manager.new_step_starts()
+        free_blocks_before_running = (
+            self.kv_cache_manager.block_pool.get_num_free_blocks()
+            if self.track_kv_admission_growth and self.running and token_budget > 0
+            else None
+        )
 
         # DP prefill balancing: on a throttled (non-cadence-aligned) step, defer
         # all prefill compute unless saturated.
@@ -479,6 +545,13 @@ class Scheduler(SchedulerInterface):
                 - request.num_computed_tokens
                 - self.num_sampled_tokens_per_step,
             )
+
+            if prefill_budget is not None and request.is_prefill_chunk:
+                num_new_tokens = prefill_budget.limit_chunk(
+                    request.num_computed_tokens,
+                    num_new_tokens,
+                    reserve=waiting_prefill_reserve,
+                )
 
             # Schedule encoder inputs.
             encoder_inputs_to_schedule = None
@@ -545,7 +618,15 @@ class Scheduler(SchedulerInterface):
                         if preempted_req in scheduled_running_reqs:
                             preempted_req_id = preempted_req.request_id
                             scheduled_running_reqs.remove(preempted_req)
-                            token_budget += num_scheduled_tokens.pop(preempted_req_id)
+                            preempted_tokens = num_scheduled_tokens.pop(preempted_req_id)
+                            token_budget += preempted_tokens
+                            if (
+                                prefill_budget is not None
+                                and preempted_req.is_prefill_chunk
+                            ):
+                                prefill_budget.refund(
+                                    preempted_req.num_computed_tokens, preempted_tokens
+                                )
                             req_to_new_blocks.pop(preempted_req_id)
                             scheduled_spec_decode_tokens.pop(preempted_req_id, None)
                             preempted_encoder_inputs = scheduled_encoder_inputs.pop(
@@ -580,6 +661,8 @@ class Scheduler(SchedulerInterface):
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
+            if prefill_budget is not None and request.is_prefill_chunk:
+                prefill_budget.consume(request.num_computed_tokens, num_new_tokens)
             req_index += 1
 
             # Speculative decode related.
@@ -624,6 +707,18 @@ class Scheduler(SchedulerInterface):
                 if req.lora_request and req.lora_request.lora_int_id > 0
             )
             assert len(scheduled_loras) <= self.lora_config.max_loras
+
+        # Exclude admissions and preemption frees from Decode growth samples.
+        if free_blocks_before_running is not None and not preempted_reqs:
+            free_now = self.kv_cache_manager.block_pool.get_num_free_blocks()
+            growth_blocks = max(0, free_blocks_before_running - free_now)
+            self.kv_cache_manager.update_admission_reserve(growth_blocks)
+            logger.debug(
+                "Decode KV growth=%d admission_watermark=%d free=%d blocks",
+                growth_blocks,
+                self.kv_cache_manager.admission_watermark_blocks,
+                free_now,
+            )
 
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
@@ -782,6 +877,7 @@ class Scheduler(SchedulerInterface):
                 external_load_encoder_input = []
                 new_encoder_compute_budget = encoder_compute_budget
                 pad_spec_decode = False
+                charge_prefill = False
 
                 if load_kv_async:
                     # KVTransfer: loading remote KV, do not allocate for new work.
@@ -830,6 +926,16 @@ class Scheduler(SchedulerInterface):
 
                     num_new_tokens = min(num_new_tokens, token_budget)
                     assert num_new_tokens > 0
+                    if prefill_budget is not None and (
+                        num_computed_tokens < request.num_prompt_tokens
+                        or num_new_tokens > 1
+                    ):
+                        num_new_tokens = prefill_budget.limit_chunk(
+                            num_computed_tokens, num_new_tokens
+                        )
+                        if num_new_tokens == 0:
+                            break
+                        charge_prefill = True
 
                     # Schedule encoder inputs.
                     if request.has_encoder_inputs:
@@ -976,6 +1082,9 @@ class Scheduler(SchedulerInterface):
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
+                if charge_prefill:
+                    assert prefill_budget is not None
+                    prefill_budget.consume(num_computed_tokens, num_new_tokens)
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 if pad_spec_decode:

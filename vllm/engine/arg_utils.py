@@ -526,6 +526,7 @@ class EngineArgs:
     max_num_partial_prefills: int = SchedulerConfig.max_num_partial_prefills
     max_long_partial_prefills: int = SchedulerConfig.max_long_partial_prefills
     long_prefill_token_threshold: int = SchedulerConfig.long_prefill_token_threshold
+    prefill_attention_budget: int = SchedulerConfig.prefill_attention_budget
     max_num_seqs: int | None = None
     max_logprobs: int = ModelConfig.max_logprobs
     logprobs_mode: LogprobsMode = ModelConfig.logprobs_mode
@@ -608,6 +609,10 @@ class EngineArgs:
     prefill_schedule_interval: int = SchedulerConfig.prefill_schedule_interval
 
     watermark: float = SchedulerConfig.watermark
+    kv_admission_reserve_window_steps: int = (
+        SchedulerConfig.kv_admission_reserve_window_steps
+    )
+    kv_admission_reserve_quantile: float = SchedulerConfig.kv_admission_reserve_quantile
 
     disable_hybrid_kv_cache_manager: bool | None = (
         SchedulerConfig.disable_hybrid_kv_cache_manager
@@ -1424,6 +1429,9 @@ class EngineArgs:
             "--long-prefill-token-threshold",
             **scheduler_kwargs["long_prefill_token_threshold"],
         )
+        scheduler_group.add_argument(
+            "--prefill-attention-budget", **scheduler_kwargs["prefill_attention_budget"]
+        )
         # multi-step scheduling has been removed; corresponding arguments
         # are no longer supported.
         scheduler_group.add_argument(
@@ -1447,6 +1455,14 @@ class EngineArgs:
             **scheduler_kwargs["scheduler_reserve_full_isl"],
         )
         scheduler_group.add_argument("--watermark", **scheduler_kwargs["watermark"])
+        scheduler_group.add_argument(
+            "--kv-admission-reserve-window-steps",
+            **scheduler_kwargs["kv_admission_reserve_window_steps"],
+        )
+        scheduler_group.add_argument(
+            "--kv-admission-reserve-quantile",
+            **scheduler_kwargs["kv_admission_reserve_quantile"],
+        )
         scheduler_group.add_argument(
             "--prefill-schedule-interval",
             **scheduler_kwargs["prefill_schedule_interval"],
@@ -2155,8 +2171,11 @@ class EngineArgs:
             max_num_partial_prefills=self.max_num_partial_prefills,
             max_long_partial_prefills=self.max_long_partial_prefills,
             long_prefill_token_threshold=self.long_prefill_token_threshold,
+            prefill_attention_budget=self.prefill_attention_budget,
             scheduler_reserve_full_isl=self.scheduler_reserve_full_isl,
             watermark=self.watermark,
+            kv_admission_reserve_window_steps=self.kv_admission_reserve_window_steps,
+            kv_admission_reserve_quantile=self.kv_admission_reserve_quantile,
             prefill_schedule_interval=self.prefill_schedule_interval,
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,

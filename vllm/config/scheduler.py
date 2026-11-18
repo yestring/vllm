@@ -81,6 +81,10 @@ class SchedulerConfig:
     """For chunked prefill, a request is considered long if the prompt is
     longer than this number of tokens."""
 
+    prefill_attention_budget: int = Field(default=0, ge=0)
+    """Optional causal query-key pair budget per Prefill iteration. Requires
+    a dedicated KV producer with chunked prefill. Zero disables the budget."""
+
     enable_chunked_prefill: bool = True
     """If True, prefill requests can be chunked based
     on the remaining `max_num_batched_tokens`.
@@ -149,6 +153,14 @@ class SchedulerConfig:
     helps avoid frequent KV cache eviction and the resulting repeated preemption
     of requests when GPU memory is scarce. Must be in the range [0.0, 1.0); 0.0
     (the default) disables the watermark."""
+
+    kv_admission_reserve_window_steps: int = Field(default=0, ge=0)
+    """Number of recent Decode iterations used to estimate KV headroom for
+    new admissions. Requires a dedicated NIXL KV consumer. Zero disables it."""
+
+    kv_admission_reserve_quantile: float = Field(default=0.9, gt=0.0, le=1.0)
+    """Quantile of running-only KV block growth used as admission headroom.
+    The static watermark remains a floor."""
 
     prefill_schedule_interval: int = Field(default=1, ge=1)
     """For data-parallel deployments, only admit new prefill requests

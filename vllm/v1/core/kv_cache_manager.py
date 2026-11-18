@@ -8,6 +8,7 @@ from typing import Literal, overload
 
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
+from vllm.v1.core.kv_admission_reserve import KVAdmissionReserve
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
@@ -123,6 +124,8 @@ class KVCacheManager:
         pcp_world_size: int = 1,
         metrics_collector: KVCacheMetricsCollector | None = None,
         watermark: float = 0.0,
+        admission_reserve_window_steps: int = 0,
+        admission_reserve_quantile: float = 0.9,
     ) -> None:
         self.max_model_len = max_model_len
         # When unset, fall back to `max_model_len` so the recycling-aware cap
@@ -161,6 +164,16 @@ class KVCacheManager:
         # admitting waiting/preempted requests, to avoid frequent preemptions.
         assert watermark >= 0.0, "watermark must be non-negative"
         self.watermark_blocks = int(watermark * kv_cache_config.num_blocks)
+        self._admission_reserve = (
+            KVAdmissionReserve(
+                admission_reserve_window_steps,
+                admission_reserve_quantile,
+                # The block pool holds one null block which is never allocated.
+                max_blocks=max(0, kv_cache_config.num_blocks - 1),
+            )
+            if admission_reserve_window_steps
+            else None
+        )
         self.kv_cache_event_metadata = tuple(
             (
                 get_kv_cache_spec_kind(group.kv_cache_spec).value,
@@ -186,6 +199,18 @@ class KVCacheManager:
             The KV cache usage (between 0.0 and 1.0).
         """
         return self.block_pool.get_usage()
+
+    @property
+    def admission_watermark_blocks(self) -> int:
+        """Return the static watermark or the current growth reserve if higher."""
+        if self._admission_reserve is None:
+            return self.watermark_blocks
+        return max(self.watermark_blocks, self._admission_reserve.blocks)
+
+    def update_admission_reserve(self, growth_blocks: int) -> None:
+        """Observe net KV growth from already-running requests this step."""
+        if self._admission_reserve is not None:
+            self._admission_reserve.observe(growth_blocks)
 
     def make_prefix_cache_stats(self) -> PrefixCacheStats | None:
         """Get (and reset) the prefix cache stats.
@@ -367,7 +392,7 @@ class KVCacheManager:
             RequestStatus.WAITING,
             RequestStatus.PREEMPTED,
         ):
-            watermark_blocks = self.watermark_blocks
+            watermark_blocks = self.admission_watermark_blocks
 
         if full_sequence_must_fit:
             # First check and fail if the full request sequence won't fit.
