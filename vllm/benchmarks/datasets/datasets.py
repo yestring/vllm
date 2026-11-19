@@ -1453,6 +1453,7 @@ class TimedTrace(BenchmarkDataset):
         self.label_input_length = str(kwargs.get("timed_trace_label_input_length"))
         self.label_output_length = str(kwargs.get("timed_trace_label_output_length"))
         self.label_hash_ids = str(kwargs.get("timed_trace_label_hash_ids"))
+        self.send_prompt_token_ids = kwargs.get("timed_trace_prompt_token_ids", False)
         print(
             f"timed-trace: chunk_size: {self.chunk_size}, "
             f"sec_multiplier: {self.sec_multiplier}, "
@@ -1570,6 +1571,11 @@ class TimedTrace(BenchmarkDataset):
             prompt_ids = self._expand_prompt(
                 entry.get(self.label_hash_ids, []), input_length, tokenizer
             )
+            if self.send_prompt_token_ids and len(prompt_ids) != input_length:
+                raise ValueError(
+                    f"Timed trace row {ind + 1}: hash_ids cover {len(prompt_ids)} "
+                    f"of {input_length} input tokens."
+                )
             prompt = tokenizer.decode(prompt_ids)
 
             # Get timestamp with proper error handling
@@ -1589,6 +1595,12 @@ class TimedTrace(BenchmarkDataset):
             ):
                 raise ValueError("Timed trace cache_salt must be a non-empty string")
 
+            request_overrides: dict[str, Any] = {}
+            if cache_salt is not None:
+                request_overrides["cache_salt"] = cache_salt
+            if self.send_prompt_token_ids:
+                request_overrides["prompt"] = prompt_ids
+
             samples.append(
                 SampleRequest(
                     prompt=prompt,
@@ -1598,7 +1610,7 @@ class TimedTrace(BenchmarkDataset):
                     multi_modal_data=None,
                     request_id=request_id_prefix + str(ind),
                     timestamp=timestamp,
-                    request_overrides={"cache_salt": cache_salt} if cache_salt else None,
+                    request_overrides=request_overrides or None,
                 )
             )
         return samples
@@ -1781,6 +1793,11 @@ def add_dataset_parser(parser: FlexibleArgumentParser):
         type=str,
         default="hash_ids",
         help=("What json label to use to index the hash ids for the input prompts."),
+    )
+    timed_trace_group.add_argument(
+        "--timed-trace-prompt-token-ids",
+        action="store_true",
+        help="Send reconstructed token IDs directly to OpenAI Completions.",
     )
 
     blazedit_group = parser.add_argument_group("blazedit dataset options")
@@ -2344,6 +2361,13 @@ def get_samples(args, tokenizer: TokenizerLike) -> list[SampleRequest]:
         )
 
     elif args.dataset_name == "timed_trace":
+        if getattr(args, "timed_trace_prompt_token_ids", False) and (
+            args.backend != "openai" or args.endpoint != "/v1/completions"
+        ):
+            raise ValueError(
+                "--timed-trace-prompt-token-ids requires --backend openai "
+                "and --endpoint /v1/completions"
+            )
         dataloader = TimedTrace(**vars(args))
         input_requests = dataloader.sample(
             num_requests=args.num_prompts,

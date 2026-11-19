@@ -210,6 +210,7 @@ def command_plan(args, trace_file, count):
         "bench", "serve", "--backend", "openai", "--base-url", url(args.proxy_port, ""),
         "--endpoint", "/v1/completions", "--model", args.model,
         "--dataset-name", "timed_trace", "--dataset-path", str(trace_file),
+        "--timed-trace-prompt-token-ids",
         "--timed-trace-chunk-hash-size", "512",
         "--timed-trace-sec-multiplier", str(0.001 * args.time_scale),
         "--self-timed", "--num-prompts", str(count), "--seed", str(args.seed),
@@ -356,6 +357,11 @@ def main():
             json.dumps(report, indent=2) + "\n", encoding="utf-8",
         )
         print(json.dumps(report["groups"]["all"], indent=2))
+        if mismatches := report["benchmark_prompt_length_mismatches"]:
+            raise RuntimeError(
+                f"{mismatches} request(s) returned a prompt length different "
+                "from the trace; see summary.json"
+            )
         if not report["groups"]["all"]["completed_with_tokens"]:
             raise RuntimeError(
                 "all requests failed or returned no tokens; see benchmark.log"
