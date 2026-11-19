@@ -46,6 +46,7 @@ def prepare_trace(path, max_model_len, start, limit, drop_oversize):
                 timestamp = item["timestamp"]
                 input_len, output_len = item["input_length"], item["output_length"]
                 hashes = item["hash_ids"]
+                salt = item.get("cache_salt")
                 if (
                     type(timestamp) not in (int, float)
                     or not math.isfinite(timestamp)
@@ -58,8 +59,9 @@ def prepare_trace(path, max_model_len, start, limit, drop_oversize):
                     or not isinstance(hashes, list)
                     or not hashes
                     or any(type(block) is not int for block in hashes)
+                    or (salt is not None and (not isinstance(salt, str) or not salt))
                 ):
-                    raise ValueError("invalid timestamp, lengths, or hash_ids")
+                    raise ValueError("invalid timestamp, lengths, hash_ids, or cache_salt")
             except (ValueError, TypeError, KeyError) as exc:
                 raise ValueError(f"{path}:{line_num}: {exc}") from exc
             previous = timestamp
@@ -73,12 +75,15 @@ def prepare_trace(path, max_model_len, start, limit, drop_oversize):
                 continue
             if origin is None:
                 origin = timestamp
-            rows.append({
+            row = {
                 "timestamp": timestamp - origin,
                 "input_length": input_len,
                 "output_length": output_len,
                 "hash_ids": hashes,
-            })
+            }
+            if salt is not None:
+                row["cache_salt"] = salt
+            rows.append(row)
             if limit and len(rows) >= limit:
                 break
     if not rows:

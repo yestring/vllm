@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import socket
 import subprocess
@@ -33,6 +34,9 @@ METRIC_PREFIXES = tuple("vllm:" + name for name in (
     "request_prefill_kv_computed_tokens", "nixl_",
 ))
 DIRECT_HTTP = build_opener(ProxyHandler({}))
+PREFIX_COUNTER = re.compile(
+    r"^(vllm:prefix_cache_(?:queries|hits)_total)(\{.*\})?\s+(\S+)"
+)
 
 
 def url(port, route):
@@ -49,7 +53,9 @@ def check_ports(ports):
             try:
                 listener.bind((HOST, port))
             except OSError as exc:
-                raise ValueError(f"port {port} is unavailable on {HOST}: {exc}") from exc
+                raise ValueError(
+                    f"port {port} is unavailable on {HOST}: {exc}"
+                ) from exc
 
 
 def wait_ready(endpoint, process, timeout, name):
@@ -89,26 +95,58 @@ def stop_process_group(process):
     process.wait()
 
 
-def scrape_metrics(path, ports, interval, stop):
-    def sample(stream):
-        for role, port in ports.items():
-            record = {"timestamp_unix": time.time(), "role": role}
-            try:
-                with DIRECT_HTTP.open(url(port, "/metrics"), timeout=2) as response:
-                    lines = response.read().decode().splitlines()
-                record["metrics"] = [
-                    line for line in lines if line.startswith(METRIC_PREFIXES)
-                ]
-            except (URLError, TimeoutError, OSError) as exc:
-                record["error"] = str(exc)
-            stream.write(json.dumps(record) + "\n")
-        stream.flush()
+def scrape_snapshot(stream, ports):
+    snapshot = {}
+    for role, port in ports.items():
+        record = {"timestamp_unix": time.time(), "role": role}
+        try:
+            with DIRECT_HTTP.open(url(port, "/metrics"), timeout=2) as response:
+                lines = response.read().decode().splitlines()
+            record["metrics"] = [
+                line for line in lines if line.startswith(METRIC_PREFIXES)
+            ]
+        except (URLError, TimeoutError, OSError) as exc:
+            record["error"] = str(exc)
+        stream.write(json.dumps(record) + "\n")
+        snapshot[role] = record
+    stream.flush()
+    return snapshot
 
-    with path.open("w", encoding="utf-8") as stream:
-        sample(stream)
+
+def scrape_metrics(path, ports, interval, stop):
+    with path.open("a", encoding="utf-8") as stream:
         while not stop.wait(interval):
-            sample(stream)
-        sample(stream)
+            scrape_snapshot(stream, ports)
+
+
+def prefix_cache_delta(before, after):
+    """Return local hit/query deltas without treating absent metrics as zero."""
+    def counters(snapshot):
+        result = {}
+        for line in snapshot.get("metrics", []):
+            if match := PREFIX_COUNTER.match(line):
+                metric, labels, raw = match.groups()
+                result[metric, labels] = float(raw)
+        return result
+
+    start, end = counters(before), counters(after)
+    deltas = {}
+    for field in ("queries", "hits"):
+        metric = f"vllm:prefix_cache_{field}_total"
+        keys = {key for key in start if key[0] == metric}
+        if keys and keys == {key for key in end if key[0] == metric} and all(
+            0 <= start[key] <= end[key] < float("inf") for key in keys
+        ):
+            deltas[field] = round(sum(end[key] - start[key] for key in keys))
+        else:
+            deltas[field] = None
+    queries, hits = deltas["queries"], deltas["hits"]
+    deltas["hit_rate"] = (
+        round(hits / queries, 6)
+        if queries and hits is not None and 0 <= hits <= queries
+        else None
+    )
+    return deltas
 
 
 def revision(repo):
@@ -205,10 +243,13 @@ def execute(args, plan):
         proxy_health = "/healthcheck" if args.mode == "pull" else "/status"
         wait_ready(url(args.proxy_port, proxy_health), proxy, 30, "proxy")
 
+        metrics_path = args.output / "metrics.jsonl"
+        with metrics_path.open("x", encoding="utf-8") as stream:
+            before = scrape_snapshot(stream, ports)
         stop = threading.Event()
         metrics_thread = threading.Thread(
             target=scrape_metrics,
-            args=(args.output / "metrics.jsonl", ports, args.scrape_interval, stop),
+            args=(metrics_path, ports, args.scrape_interval, stop),
         )
         metrics_thread.start()
         try:
@@ -230,6 +271,9 @@ def execute(args, plan):
         finally:
             stop.set()
             metrics_thread.join()
+            with metrics_path.open("a", encoding="utf-8") as stream:
+                after = scrape_snapshot(stream, ports)
+        return {role: prefix_cache_delta(before[role], after[role]) for role in ports}
 
 
 def parse_args():
@@ -302,9 +346,12 @@ def main():
         if args.dry_run:
             print(f"Prepared {len(rows)} requests and a manifest in {args.output}")
             return
-        execute(args, plan)
-        result = json.loads((args.output / "benchmark.json").read_text(encoding="utf-8"))
+        cache_deltas = execute(args, plan)
+        result = json.loads(
+            (args.output / "benchmark.json").read_text(encoding="utf-8")
+        )
         report = summarize(result, rows, args.ttft_ms, args.tpot_ms)
+        report["prefix_cache"] = cache_deltas
         (args.output / "summary.json").write_text(
             json.dumps(report, indent=2) + "\n", encoding="utf-8",
         )

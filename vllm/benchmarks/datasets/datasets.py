@@ -1583,6 +1583,11 @@ class TimedTrace(BenchmarkDataset):
             timestamp = float(ts_value) * self.sec_multiplier
 
             prompt_len = len(prompt_ids)
+            cache_salt = entry.get("cache_salt")
+            if cache_salt is not None and (
+                not isinstance(cache_salt, str) or not cache_salt
+            ):
+                raise ValueError("Timed trace cache_salt must be a non-empty string")
 
             samples.append(
                 SampleRequest(
@@ -1593,6 +1598,7 @@ class TimedTrace(BenchmarkDataset):
                     multi_modal_data=None,
                     request_id=request_id_prefix + str(ind),
                     timestamp=timestamp,
+                    request_overrides={"cache_salt": cache_salt} if cache_salt else None,
                 )
             )
         return samples
