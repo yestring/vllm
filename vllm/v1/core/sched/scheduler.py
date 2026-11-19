@@ -134,6 +134,17 @@ class Scheduler(SchedulerInterface):
         self.recompute_kv_load_failures = True
         self.defer_block_free = False
         kv_transfer_config = self.vllm_config.kv_transfer_config
+        # In this older async scheduler, one pending token represents one
+        # pending output frame only for single-stage, non-speculative decoding.
+        self.drop_preempted_remote_prefill_output = (
+            self.scheduler_config.async_scheduling is True
+            and self.parallel_config.pipeline_parallel_size == 1
+            and self.num_sampled_tokens_per_step == 1
+            and vllm_config.speculative_config is None
+            and kv_transfer_config is not None
+            and kv_transfer_config.kv_connector == "NixlConnector"
+            and kv_transfer_config.kv_role == "kv_producer"
+        )
         self.prefill_attention_budget_limit = self.scheduler_config.prefill_attention_budget
         if self.prefill_attention_budget_limit:
             if (
@@ -644,7 +655,19 @@ class Scheduler(SchedulerInterface):
                     else:
                         preempted_req = self.running.pop()
 
-                    self._preempt_request(preempted_req, scheduled_timestamp)
+                    drop_stale_output = (
+                        self.drop_preempted_remote_prefill_output
+                        and bool(
+                            (preempted_req.kv_transfer_params or {}).get(
+                                "do_remote_decode"
+                            )
+                        )
+                    )
+                    self._preempt_request(
+                        preempted_req,
+                        scheduled_timestamp,
+                        drop_stale_output=drop_stale_output,
+                    )
                     preempted_reqs.append(preempted_req)
                     if preempted_req == request:
                         # No more request to preempt. Cannot schedule this request.
@@ -1237,11 +1260,16 @@ class Scheduler(SchedulerInterface):
     ) -> KVConnectorMetadata:
         return connector.build_connector_meta(scheduler_output)
 
-    def _preempt_request(self, request: Request, timestamp: float) -> None:
+    def _preempt_request(
+        self, request: Request, timestamp: float, *, drop_stale_output: bool = False
+    ) -> None:
         """Preempt a request and put it back to the waiting queue.
 
         NOTE: The request should be popped from the running queue outside of this
         method.
+
+        Discard pending output when a KV handoff needs blocks that preemption
+        releases, or when a forced reset can reschedule the request immediately.
         """
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
@@ -1249,6 +1277,9 @@ class Scheduler(SchedulerInterface):
         self._free_request_blocks(request)
         self.encoder_cache_manager.free(request)
         self._inflight_prefills.discard(request)
+        if drop_stale_output:
+            request.async_tokens_to_discard += request.num_output_placeholders
+            request.num_output_placeholders = 0
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
         if request.spec_token_ids:
@@ -2298,15 +2329,7 @@ class Scheduler(SchedulerInterface):
             # running queue in FIFO order.
             while self.running:
                 request = self.running.pop()
-                self._preempt_request(request, timestamp)
-                # For async scheduling, any output frames already in flight at
-                # preemption time are now stale and must be discarded when they
-                # return. num_output_placeholders is exactly that count: 0 if
-                # the engine has drained (e.g. pause_generation(keep) waited
-                # for idle), 1 for vanilla async mid-step, or 1 + spec/PP frames
-                # otherwise.
-                request.async_tokens_to_discard = request.num_output_placeholders
-                request.num_output_placeholders = 0
+                self._preempt_request(request, timestamp, drop_stale_output=True)
 
             # Clear scheduled request ids cache. Since we are forcing preemption
             # + resumption in the same step, we must act as if these requests were

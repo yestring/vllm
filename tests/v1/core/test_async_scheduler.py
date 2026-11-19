@@ -5,12 +5,14 @@ from unittest.mock import Mock
 
 import pytest
 
+from vllm.config import KVTransferConfig
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import RequestStatus
 from vllm.v1.utils import ConstantList
 
+from . import utils
 from .utils import create_requests, create_scheduler
 
 pytestmark = pytest.mark.cpu_test
@@ -134,6 +136,64 @@ def test_preempt():
     for i, req in enumerate(requests):
         assert req.status == RequestStatus.FINISHED_ABORTED
         assert req.num_output_tokens == abort_order_copy.index(i)
+
+
+@pytest.mark.parametrize("kv_role", ["kv_producer", "kv_consumer"])
+def test_preempt_with_prefill_handoff_output_in_flight(monkeypatch, kv_role):
+    def make_transfer_config(**kwargs):
+        kwargs["kv_role"] = kv_role
+        return KVTransferConfig(**kwargs)
+
+    monkeypatch.setattr(utils, "KVTransferConfig", make_transfer_config)
+    scheduler = create_scheduler(
+        async_scheduling=True,
+        use_kv_connector="NixlConnector",
+        use_v2_model_runner=True,
+        num_blocks=5,
+        block_size=16,
+        max_num_batched_tokens=512,
+    )
+    pressure_req = create_requests(
+        num_requests=1, num_tokens=32, max_tokens=8, req_ids=["pressure"]
+    )[0]
+    handoff_req = create_requests(
+        num_requests=1, num_tokens=32, max_tokens=1, req_ids=["handoff"]
+    )[0]
+    is_producer = kv_role == "kv_producer"
+    assert scheduler.drop_preempted_remote_prefill_output is is_producer
+    if is_producer:
+        handoff_req.kv_transfer_params = {"do_remote_decode": True}
+    scheduler.add_request(pressure_req)
+    scheduler.add_request(handoff_req)
+
+    # Two 32-token prefills fill the four usable blocks. The next decode
+    # needs another block and preempts the hand-off before its sample arrives.
+    prefill = scheduler.schedule()
+    assert handoff_req.status == RequestStatus.RUNNING
+    assert handoff_req.num_output_placeholders == 1
+    decode = scheduler.schedule()
+    assert handoff_req.request_id in decode.preempted_req_ids
+    assert handoff_req.status == RequestStatus.PREEMPTED
+    scheduler.update_from_output(prefill, _make_model_runner_output(prefill))
+
+    if not is_producer:
+        assert handoff_req.status == RequestStatus.FINISHED_LENGTH_CAPPED
+        assert handoff_req.num_output_tokens == 1
+        return
+
+    assert handoff_req.status == RequestStatus.PREEMPTED
+    assert handoff_req.num_output_tokens == 0
+    assert handoff_req.async_tokens_to_discard == 0
+    scheduler.update_from_output(decode, _make_model_runner_output(decode))
+    scheduler.finish_requests(pressure_req.request_id, RequestStatus.FINISHED_ABORTED)
+
+    retry = scheduler.schedule()
+    assert retry.num_scheduled_tokens[handoff_req.request_id] == 32
+    outputs = scheduler.update_from_output(retry, _make_model_runner_output(retry))
+    transfer = outputs[handoff_req.client_index].outputs[0].kv_transfer_params
+    assert transfer is not None and transfer["do_remote_prefill"]
+    assert transfer["remote_num_tokens"] == 32
+    assert [len(group) for group in transfer["remote_block_ids"]] == [2]
 
 
 def test_prefix_caching_for_prefill_dedup():
