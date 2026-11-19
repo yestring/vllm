@@ -1,11 +1,14 @@
 """Run all four P/D policy combinations on paired cold/warm prefix traces."""
 
 import argparse
+import fcntl
 import json
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 
+from run_baseline import command_plan, parse_args as parse_baseline_args
 from workload import nonnegative_int, positive_float, synthetic_trace, write_trace
 
 
@@ -60,6 +63,7 @@ def parse_args():
     parser.add_argument("--seed", type=nonnegative_int, default=0)
     parser.add_argument("--eager", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--resume", action="store_true", help="Resume an existing matrix.")
     args = parser.parse_args()
     if not args.prefill_budget or not args.decode_window or args.decode_quantile > 1:
         parser.error(
@@ -73,10 +77,47 @@ def run_matrix(args):
     cold, warm, eligible = paired_traces(
         synthetic_trace(args.scenario, args.requests, args.rate), args.prefix_tokens,
     )
-    output.mkdir(parents=True, exist_ok=False)
-    write_trace(output / "cold.jsonl", cold)
-    write_trace(output / "warm.jsonl", warm)
+    if not args.resume:
+        output.mkdir(parents=True, exist_ok=False)
+    with (output / ".matrix.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ValueError(f"matrix is already running: {output}") from exc
+        run_cases(args, output, {"cold": cold, "warm": warm}, eligible)
 
+
+def read_trace(path):
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+
+
+def save_matrix(path, matrix):
+    pending = path.with_suffix(".tmp")
+    pending.write_text(json.dumps(matrix, indent=2) + "\n", encoding="utf-8")
+    pending.replace(path)
+
+
+def validate_completed_run(output, row, command, trace, count):
+    run = output / row["directory"]
+    argv = command[2:] + ["--output", str(run)]
+    parsed = parse_baseline_args(argv)
+    plan = command_plan(parsed, run / "trace.jsonl", count)
+    expected_commands = {role: list(entry) for role, entry in plan.items()}
+    manifest = json.loads((run / "manifest.json").read_text(encoding="utf-8"))
+    if (
+        manifest["commands"] != expected_commands
+        or manifest["slo_ms"] != {"ttft": parsed.ttft_ms, "tpot": parsed.tpot_ms}
+        or read_trace(run / "trace.jsonl") != trace
+    ):
+        raise ValueError(f"saved run does not match the requested experiment: {run}")
+    if not parsed.dry_run and not (run / "summary.json").is_file():
+        raise ValueError(f"saved run is missing summary.json: {run}")
+
+
+def run_cases(args, output, traces, eligible):
     matrix = {
         "scenario": args.scenario,
         "rate": args.rate,
@@ -84,7 +125,6 @@ def run_matrix(args):
         "shared_prefix_tokens": args.prefix_tokens,
         "shared_prefix_eligible_requests": eligible,
         "dry_run": args.dry_run,
-        "runs": [],
     }
     baseline = Path(__file__).with_name("run_baseline.py").resolve()
     common = [
@@ -113,31 +153,63 @@ def run_matrix(args):
         ("base", []), ("prefill-only", prefill), ("decode-only", decode),
         ("both", prefill + decode),
     )
+    commands = {}
     for index, (name, policy) in enumerate(policies):
         # Alternate each pair's order to reduce systematic warm-after-cold bias.
         phases = ("cold", "warm") if index % 2 == 0 else ("warm", "cold")
         for phase in phases:
-            run = output / f"{name}-{phase}"
-            print(f"Running {run.name}", flush=True)
-            command = common + policy + [
-                "--trace", str(output / f"{phase}.jsonl"), "--output", str(run),
+            commands[name, phase] = common + policy + [
+                "--trace", str(output / f"{phase}.jsonl"),
             ]
-            result = subprocess.run(command, check=False)
-            row = {"policy": name, "prefix": phase, "directory": run.name,
-                   "exit_code": result.returncode}
-            if result.returncode == 0 and not args.dry_run:
-                summary = json.loads(
-                    (run / "summary.json").read_text(encoding="utf-8")
+
+    by_case = {}
+    if args.resume:
+        previous = json.loads(matrix_path.read_text(encoding="utf-8"))
+        if any(previous.get(key) != value for key, value in matrix.items()):
+            raise ValueError(f"saved workload does not match: {matrix_path}")
+        for phase, trace in traces.items():
+            if read_trace(output / f"{phase}.jsonl") != trace:
+                raise ValueError(f"saved {phase} trace differs from the requested trace")
+        for row in previous["runs"]:
+            case = (row["policy"], row["prefix"])
+            if case not in commands or case in by_case:
+                raise ValueError(f"unexpected saved policy/prefix pair: {case}")
+            by_case[case] = row
+            if row["exit_code"] == 0:
+                validate_completed_run(
+                    output, row, commands[case], traces[case[1]], args.requests,
                 )
-                row["prefill_prefix_cache"] = summary["prefix_cache"]["prefill"]
-                row["groups"] = summary["groups"]
-            matrix["runs"].append(row)
-            matrix_path.write_text(
-                json.dumps(matrix, indent=2) + "\n", encoding="utf-8",
-            )
-            result.check_returncode()
+    else:
+        for phase, trace in traces.items():
+            write_trace(output / f"{phase}.jsonl", trace)
+        matrix["runs"] = []
+        save_matrix(matrix_path, matrix)
+
+    for (name, phase), command in commands.items():
+        case = (name, phase)
+        if case in by_case and by_case[case]["exit_code"] == 0:
+            print(f"Reusing {by_case[case]['directory']}", flush=True)
+            continue
+        run = output / f"{name}-{phase}"
+        if run.exists():
+            retry = tempfile.mkdtemp(prefix=f"{run.name}-retry.", dir=output)
+            run = Path(retry) / "run"
+        directory = str(run.relative_to(output))
+        print(f"Running {directory}", flush=True)
+        result = subprocess.run(command + ["--output", str(run)], check=False)
+        row = {"policy": name, "prefix": phase, "directory": directory,
+               "exit_code": result.returncode}
+        if result.returncode == 0 and not args.dry_run:
+            summary = json.loads((run / "summary.json").read_text(encoding="utf-8"))
+            row["prefill_prefix_cache"] = summary["prefix_cache"]["prefill"]
+            row["groups"] = summary["groups"]
+        by_case[case] = row
+        matrix["runs"] = list(by_case.values())
+        save_matrix(matrix_path, matrix)
+        result.check_returncode()
+
+    matrix["runs"] = list(by_case.values())
     if not args.dry_run:
-        by_case = {(row["policy"], row["prefix"]): row for row in matrix["runs"]}
         matrix["prefill_hit_rate_delta"] = {}
         for name, _ in policies:
             cold_rate = by_case[name, "cold"]["prefill_prefix_cache"]["hit_rate"]
@@ -147,7 +219,7 @@ def run_matrix(args):
                 if cold_rate is not None and warm_rate is not None
                 else None
             )
-        matrix_path.write_text(json.dumps(matrix, indent=2) + "\n", encoding="utf-8")
+    save_matrix(matrix_path, matrix)
     print(f"Comparison: {matrix_path}")
 
 

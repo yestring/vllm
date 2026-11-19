@@ -51,7 +51,10 @@ def check_ports(ports):
             raise ValueError(f"invalid TCP port: {port}")
         with socket.socket() as listener:
             try:
+                # Match the HTTP servers' ability to reuse TIME_WAIT sockets.
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 listener.bind((HOST, port))
+                listener.listen(1)
             except OSError as exc:
                 raise ValueError(
                     f"port {port} is unavailable on {HOST}: {exc}"
@@ -277,7 +280,7 @@ def execute(args, plan):
         return {role: prefix_cache_delta(before[role], after[role]) for role in ports}
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", type=Path, required=True)
     parser.add_argument("--trace", type=Path, required=True)
@@ -308,7 +311,7 @@ def parse_args():
     parser.add_argument("--benchmark-timeout", type=positive_float, default=3600)
     parser.add_argument("--seed", type=nonnegative_int, default=0)
     parser.add_argument("--dry-run", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if (args.prefill_gpu == args.decode_gpu or
             any("," in gpu or not gpu for gpu in (args.prefill_gpu, args.decode_gpu))):
         parser.error("specify two distinct single GPU IDs")
