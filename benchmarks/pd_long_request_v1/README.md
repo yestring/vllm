@@ -60,6 +60,18 @@ CUDA_VISIBLE_DEVICES=0 "$PY" "$BENCH/profile_attention.py" \
 
 脚本单独计时一层 paged FlashAttention，K/V 已经写入页，输出包括中位数和 P95。模型投影、KV 写入、多卡通信和请求排队另由端到端实验覆盖。若要对照同一后端，可在矩阵命令加 `--attention-backend FLASH_ATTN`，并核对启动日志、FlashAttention 版本和 KV 布局。用 Nsight Systems 时，可通过 `nsys profile --trace=cuda,nvtx` 包住命令，再加 `--nvtx` 记录形状区间。
 
+## 检查长短请求的 KV 交接重叠
+
+从已有 `cold.jsonl` 抽取六对 28K → 1K 请求。两组使用相同的 token IDs，先发一个独立 1K 请求预热连接，再分别以 18 秒和 100/500/1000 毫秒的间隔发出每对请求。沿用单机 1P1D、TP=1 的 NIXL Pull 配置。
+
+```bash
+OUT=$(mktemp -d /workspace/vllm-kv-timeline.XXXXXX)
+UCX_LOG_LEVEL=info UCX_PROTO_INFO=y "$PY" "$BENCH/run_kv_timeline.py" \
+  --trace /workspace/vllm-benchmark.KNwXSi/matrix/cold.jsonl --output "$OUT"
+```
+
+`timeline-report.txt` 将代理收到 P 响应、向 D 转发、D 提交 READ、D 观察到 DONE 和客户端收到首 token 对齐。P/D 之间用 NIXL 远端请求 ID，代理和客户端之间用 benchmark 请求 ID。`timeline.jsonl` 保存原始事件，`decode.log` 保存 UCX 日志。报告检查哪些短请求的 READ 提交落在长请求的 READ 区间内。所有时间戳使用同一主机的 `perf_counter`。分析器要求每个请求一次 READ，遇到缺失或重复事件会报错并保留原始结果。
+
 ## 看结果
 
 - `manifest.json` 保存 commit、设备参数、trace SHA-256、SLO 和完整命令。`summary.json` 保存总体和分组的 TTFT、TPOT、SLO 达标率及达标请求每秒。达标率分母包含失败请求，goodput 的时间分母包含清空队列的时间。

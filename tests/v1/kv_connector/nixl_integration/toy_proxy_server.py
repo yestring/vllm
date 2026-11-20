@@ -5,6 +5,7 @@ import argparse
 import itertools
 import logging
 import os
+import time
 import uuid
 from contextlib import asynccontextmanager
 
@@ -14,6 +15,11 @@ from fastapi.responses import StreamingResponse
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
+
+if os.environ.get("PD_KV_TIMELINE_PATH"):
+    from vllm.kv_timeline import trace_kv_event
+else:
+    trace_kv_event = None
 
 
 @asynccontextmanager
@@ -228,6 +234,7 @@ async def _handle_completions(api: str, request: Request):
         response = await send_request_to_service(
             prefill_client_info, api, req_data, request_id
         )
+        p_done_ns = time.perf_counter_ns() if trace_kv_event is not None else None
 
         # Extract the needed fields
         response_json = response.json()
@@ -236,6 +243,19 @@ async def _handle_completions(api: str, request: Request):
         if kv_transfer_params:
             req_data["kv_transfer_params"] = kv_transfer_params
 
+        remote_id = None
+        if trace_kv_event is not None and p_done_ns is not None and kv_transfer_params:
+            remote_id = kv_transfer_params.get("remote_request_id")
+            if remote_id:
+                usage = response_json.get("usage") or {}
+                trace_kv_event(
+                    "p_done",
+                    remote_id,
+                    p_done_ns,
+                    client_request_id=request.headers.get("x-request-id", ""),
+                    prompt_tokens=usage.get("prompt_tokens", 0),
+                )
+
         # Get the next decode client in round-robin fashion
         decode_client_info = get_next_client(request.app, "decode")
 
@@ -243,6 +263,8 @@ async def _handle_completions(api: str, request: Request):
 
         # Stream response from decode service
         async def generate_stream():
+            if trace_kv_event is not None and remote_id:
+                trace_kv_event("d_forward", remote_id, time.perf_counter_ns())
             async for chunk in stream_service_response(
                 decode_client_info, api, req_data, request_id=request_id
             ):

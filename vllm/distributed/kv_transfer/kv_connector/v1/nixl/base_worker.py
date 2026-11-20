@@ -63,6 +63,7 @@ from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from vllm.kv_timeline import KV_TIMELINE_PATH, trace_kv_event
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.network_utils import make_zmq_path
@@ -2039,10 +2040,23 @@ class NixlBaseConnectorWorker:
                 try:
                     xfer_state = self.nixl_wrapper.check_xfer_state(handle)
                     if xfer_state == "DONE":
+                        done_ns = time.perf_counter_ns() if KV_TIMELINE_PATH else None
                         # Get telemetry from NIXL
                         res = self.nixl_wrapper.get_xfer_telemetry(handle)
                         self.xfer_stats.record_transfer(res)
                         self.nixl_wrapper.release_xfer_handle(handle)
+                        if done_ns is not None and transfers is self._recving_transfers:
+                            meta = self._recving_metadata.get(req_id)
+                            if meta is not None and meta.remote is not None:
+                                trace_kv_event(
+                                    "read_done",
+                                    meta.remote.request_id,
+                                    done_ns,
+                                    d_request_id=req_id,
+                                    bytes=int(res.totalBytes),
+                                    descs=int(res.descCount),
+                                    xfer_ns=int(res.xferDuration * 1000),
+                                )
                     elif xfer_state == "PROC":
                         in_progress.append(handle)
                         continue

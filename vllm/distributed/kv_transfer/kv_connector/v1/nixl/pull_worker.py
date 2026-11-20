@@ -17,6 +17,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
     ReadSpec,
 )
+from vllm.kv_timeline import KV_TIMELINE_PATH, trace_kv_event
 from vllm.logger import init_logger
 
 if TYPE_CHECKING:
@@ -310,10 +311,15 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             )
 
             # Begin async xfer.
+            submit_ns = time.perf_counter_ns() if KV_TIMELINE_PATH else None
             self.nixl_wrapper.transfer(handle)
 
             # Use handle to check completion in future step().
             self._recving_transfers[request_id].append(handle)
+            if submit_ns is not None:
+                trace_kv_event(
+                    "read_submit", remote_request_id, submit_ns, d_request_id=request_id
+                )
         except Exception as e:
             # mark all (logical) blocks for this request as invalid
             self._log_failure(
