@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.kv_cache_interface import KVCacheConfig
+    from vllm.v1.outputs import KVConnectorOutput
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -30,6 +31,13 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
         kv_cache_config: "KVCacheConfig",
     ):
         super().__init__(vllm_config, engine_id, kv_cache_config)
+        transfer_config = vllm_config.kv_transfer_config
+        assert transfer_config is not None
+        self._keep_segmented_read_heartbeats = (
+            transfer_config.kv_role == "kv_consumer"
+            and transfer_config.get_from_extra_config("read_chunk_bytes", 0) > 0
+        )
+        self._pending_segmented_receives: set[str] = set()
 
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
@@ -165,6 +173,12 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
                         request,
                         local_block_ids,
                     )
+                    if (
+                        self._keep_segmented_read_heartbeats
+                        and params.get("do_remote_prefill")
+                        and any(local_block_ids)
+                    ):
+                        self._pending_segmented_receives.add(request.request_id)
 
                 else:
                     logger.warning(
@@ -177,6 +191,13 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             # Only trigger 1 KV transfer per request.
             params["do_remote_prefill"] = False
             params["_remote_blocks_processed"] = True
+
+    def update_connector_output(self, connector_output: "KVConnectorOutput") -> None:
+        super().update_connector_output(connector_output)
+        if self._pending_segmented_receives:
+            self._pending_segmented_receives.difference_update(
+                connector_output.finished_recving or ()
+            )
 
     def request_finished(
         self,
@@ -203,9 +224,10 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
         is_p_node = bool(params.get("do_remote_decode"))
         is_d_node = not is_p_node
 
-        # Stop heartbeating for aborted requests that never reached finished_recving:
-        # normal path cleans up in update_connector_output.
-        self._stop_heartbeat(request.request_id)
+        # Segmented receives drain after client abort and still need the remote
+        # KV lease. The worker's terminal receipt stops the heartbeat.
+        if request.request_id not in self._pending_segmented_receives:
+            self._stop_heartbeat(request.request_id)
 
         if params.get("do_remote_prefill"):
             # If do_remote_prefill is still True when the request is finished,

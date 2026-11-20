@@ -3,6 +3,7 @@
 """Pull-specific (READ) worker-side logic for the NIXL connector."""
 
 import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -14,17 +15,35 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     NixlConnectorMetadata,
     ReqMeta,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.read_queue import (
+    ReadyReadQueue,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
     ReadSpec,
 )
 from vllm.kv_timeline import KV_TIMELINE_PATH, trace_kv_event
 from vllm.logger import init_logger
+from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class _Read:
+    local_handle: int
+    remote_handle: int
+    local_descs: np.ndarray
+    remote_descs: np.ndarray
+    engine_id: str
+    remote_rank: int
+    remote_request_id: str
+    notif_id: bytes
+    limit: int
+    offset: int = 0
 
 
 class NixlPullConnectorWorker(NixlBaseConnectorWorker):
@@ -37,12 +56,92 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         kv_cache_config: "KVCacheConfig",
     ):
         super().__init__(vllm_config, engine_id, kv_cache_config)
+        self._read_chunk_bytes = self.kv_transfer_config.get_from_extra_config(
+            "read_chunk_bytes", 0
+        )
+        if type(self._read_chunk_bytes) is not int or self._read_chunk_bytes < 0:
+            raise ValueError("read_chunk_bytes must be a nonnegative integer")
+        if self._read_chunk_bytes:
+            groups = self.kv_cache_config.kv_cache_groups
+            if (
+                self.kv_transfer_config.kv_role != "kv_consumer"
+                or self.world_size != 1
+                or self.device_type != "cuda"
+                or self.use_host_buffer
+                or self.nixl_backends != ["UCX"]
+                or self.use_mla
+                or len(groups) != 1
+                or not isinstance(groups[0].kv_cache_spec, FullAttentionSpec)
+            ):
+                raise ValueError(
+                    "read_chunk_bytes requires a TP1 CUDA UCX Pull consumer "
+                    "with a uniform full-attention KV cache"
+                )
+            # A long request gets a segment between consecutive short grants.
+            self._ready_reads = ReadyReadQueue(max_short_burst=1)
+            self._segmented_reads: dict[str, _Read] = {}
+            self._chunk_desc_limit = 0
+            logger.info(
+                "NIXL Pull segmented READ enabled (max %d bytes per segment)",
+                self._read_chunk_bytes,
+            )
+
+    def _retire_finished_reads(self, done: set[str], failed: set[str]) -> set[str]:
+        if not self._read_chunk_bytes:
+            return super()._retire_finished_reads(done, failed)
+
+        for req_id in failed:
+            self._ready_reads.discard(req_id)
+            self._segmented_reads.pop(req_id, None)
+
+        for req_id in tuple(done - failed):
+            read = self._segmented_reads.get(req_id)
+            if read is None:
+                continue
+            if read.offset == len(read.local_descs):
+                del self._segmented_reads[req_id]
+            else:
+                # Keep D blocks and P's lease until the whole logical READ is done.
+                done.remove(req_id)
+                self._ready_reads.add(req_id, short=False)
+        return done | failed
+
+    def _post_next_segment(self) -> None:
+        if self._recving_transfers:
+            return
+        req_id = self._ready_reads.pop_next()
+        if req_id is None:
+            return
+        read = self._segmented_reads[req_id]
+        end = min(read.offset + read.limit, len(read.local_descs))
+        # Sending the original notification releases P's KV. Only the last
+        # segment may send it, after all earlier handles have completed.
+        notif_id = read.notif_id if end == len(read.local_descs) else b""
+        if self._post_read(
+            req_id,
+            read.engine_id,
+            read.remote_rank,
+            read.remote_request_id,
+            read.local_handle,
+            read.remote_handle,
+            read.local_descs[read.offset:end],
+            read.remote_descs[read.offset:end],
+            notif_id,
+        ):
+            read.offset = end
 
     def start_load_kv(self, metadata: NixlConnectorMetadata):
         """
         Start loading by triggering non-blocking nixl_xfer.
         We check for these trnxs to complete in each step().
         """
+        if self._read_chunk_bytes and self._segmented_reads:
+            # Heartbeat processing may evict idle peers. Queued segments still
+            # reference their registered descriptor lists.
+            now = time.perf_counter()
+            for read in self._segmented_reads.values():
+                self._engine_last_active[read.engine_id] = now
+
         for req_id, meta in metadata.reqs_to_recv.items():
             meta.local_physical_block_ids = self._logical_to_kernel_block_ids(
                 meta.local_block_ids
@@ -98,6 +197,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         # Send heartbeats to P-side engines to keep KV blocks alive while
         # requests sit in the D scheduler WAITING queue.
         self._send_heartbeats(metadata)
+        if self._read_chunk_bytes:
+            self._post_next_segment()
 
     def _read_blocks_for_req(self, req_id: str, meta: ReqMeta):
         assert meta.remote is not None and self.transfer_topo is not None
@@ -298,6 +399,70 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
 
         assert len(local_block_descs_ids) == len(remote_block_descs_ids)
 
+        if self._read_chunk_bytes and len(local_block_descs_ids):
+            if request_id in self._segmented_reads:
+                raise RuntimeError(f"Duplicate segmented READ for request {request_id}")
+            try:
+                if (
+                    remote_info.remote_tp_size != 1
+                    or block_size_ratio != 1
+                    or self.enable_permute_local_kv
+                    or self.enable_heterogeneous_attn_post_process
+                ):
+                    raise ValueError("Segmented READ requires matching TP1 KV layouts")
+                if not self._chunk_desc_limit:
+                    # The base worker registers contiguous descriptor IDs per region.
+                    sizes = {
+                        size for _, size, _ in self.src_blocks_data[:: self.num_blocks]
+                    }
+                    if len(sizes) != 1:
+                        raise ValueError("Segmented READ requires uniform descriptors")
+                    self._chunk_desc_limit = self._read_chunk_bytes // sizes.pop()
+                    if not self._chunk_desc_limit:
+                        raise ValueError("read_chunk_bytes is smaller than a descriptor")
+                self._segmented_reads[request_id] = _Read(
+                    local_xfer_side_handle,
+                    remote_xfer_side_handle,
+                    local_block_descs_ids,
+                    remote_block_descs_ids,
+                    dst_engine_id,
+                    remote_rank,
+                    remote_request_id,
+                    notif_id,
+                    self._chunk_desc_limit,
+                )
+                self._ready_reads.add(
+                    request_id, short=len(local_block_descs_ids) <= self._chunk_desc_limit
+                )
+            except ValueError as e:
+                self._log_failure("segmented_read_setup_failed", request_id, error=e)
+                self._handle_failed_transfer(request_id, None)
+            return
+
+        self._post_read(
+            request_id,
+            dst_engine_id,
+            remote_rank,
+            remote_request_id,
+            local_xfer_side_handle,
+            remote_xfer_side_handle,
+            local_block_descs_ids,
+            remote_block_descs_ids,
+            notif_id,
+        )
+
+    def _post_read(
+        self,
+        request_id: str,
+        dst_engine_id: str,
+        remote_rank: int,
+        remote_request_id: str,
+        local_xfer_side_handle: int,
+        remote_xfer_side_handle: int,
+        local_block_descs_ids: np.ndarray,
+        remote_block_descs_ids: np.ndarray,
+        notif_id: bytes,
+    ) -> bool:
         # Prepare transfer with Nixl.
         handle = None
         try:
@@ -320,6 +485,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 trace_kv_event(
                     "read_submit", remote_request_id, submit_ns, d_request_id=request_id
                 )
+            return True
         except Exception as e:
             # mark all (logical) blocks for this request as invalid
             self._log_failure(
@@ -331,6 +497,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 remote_rank=remote_rank,
             )
             self._handle_failed_transfer(request_id, handle)
+            return False
 
     def _get_new_notifs(self) -> set[str]:
         """

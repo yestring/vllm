@@ -1881,6 +1881,12 @@ class NixlBaseConnectorWorker:
                 indices=indices,
             )
 
+    def _retire_finished_reads(
+        self, done: set[str], failed: set[str]
+    ) -> set[str]:
+        done.update(failed)
+        return done
+
     def get_finished(self) -> tuple[set[str], set[str]]:
         """
         Get requests that are done sending or recving on this specific worker.
@@ -1901,7 +1907,7 @@ class NixlBaseConnectorWorker:
 
         # Add failed requests to done_recving for scheduler tracking
         # (blocks are already marked invalid, scheduler will handle recompute)
-        done_recving.update(failed_recv_reqs)
+        done_recving = self._retire_finished_reads(done_recving, failed_recv_reqs)
 
         if len(done_sending) > 0 or len(done_recving) > 0:
             logger.debug(
