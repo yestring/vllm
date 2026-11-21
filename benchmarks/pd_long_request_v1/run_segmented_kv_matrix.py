@@ -35,12 +35,12 @@ DETAILED_COLUMNS = ("input_lens", "output_lens", "ttfts", "itls", "errors", "sta
 PORT_FLAGS = (
     "prefill-port", "decode-port", "proxy-port", "prefill-side-port", "decode-side-port",
 )
-ARMS = (
-    ("native", False, False),
-    ("prefill-only", True, False),
-    ("segmented-only", False, True),
-    ("both", True, True),
-)
+ARMS = {
+    "native": (False, False),
+    "prefill-only": (True, False),
+    "segmented-only": (False, True),
+    "both": (True, True),
+}
 REQUIRED_METRICS = ("nixl_xfer_time_seconds_count", "nixl_bytes_transferred_sum")
 OPTIONAL_METRICS = ("nixl_xfer_time_seconds_sum", "nixl_num_failed_transfers_total")
 SEGMENTED_LOG = "NIXL Pull segmented READ enabled"
@@ -264,6 +264,7 @@ def run_matrix(args, rows):
         "trace": str(args.trace),
         "prefill_budget": PREFILL_BUDGET,
         "read_chunk_bytes": READ_CHUNK_BYTES,
+        "arm_order": args.arms,
         "runs": [],
     }
     save(output, matrix)
@@ -271,7 +272,8 @@ def run_matrix(args, rows):
     used_ports = set()
     baseline = None
     try:
-        for name, prefill, segmented in ARMS:
+        for name in args.arms:
+            prefill, segmented = ARMS[name]
             case = output / name
             current = {"arm": name, "directory": name}
             matrix["runs"].append(current)
@@ -314,9 +316,18 @@ def main():
     parser.add_argument("--prefill-gpu", default="0")
     parser.add_argument("--decode-gpu", default="2")
     parser.add_argument("--rate", type=positive_float, default=0.5)
+    parser.add_argument(
+        "--arms",
+        choices=tuple(ARMS),
+        default=list(ARMS),
+        nargs="+",
+        help="Select benchmark arms in the order they should run (default: all four).",
+    )
     parser.add_argument("--startup-timeout", type=positive_float, default=180)
     parser.add_argument("--benchmark-timeout", type=positive_float, default=1800)
     args = parser.parse_args()
+    if len(set(args.arms)) != len(args.arms):
+        parser.error("each arm can appear at most once per output directory")
     pair = sorted((args.prefill_gpu, args.decode_gpu))
     if pair[0] == pair[1] or any(not gpu or "," in gpu for gpu in pair):
         parser.error("specify two distinct single GPU IDs")
